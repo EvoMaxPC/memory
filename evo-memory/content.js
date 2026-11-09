@@ -98,7 +98,7 @@
       else if (p.seen[k] === 1) { p.seen[k] = firma; dirty = true; } // formato viejo (solo presencia)
       else dupEvitados++; // mismo id y mismo contenido: duplicado evitado, no se reprocesa
       if (m.role === 'user') { if (!p.analyzed[k]) { p.analyzed[k] = firma; dirty = true; analyze(m, silent); } }
-      else if (!streaming && p.analyzed[k] !== firma) { p.analyzed[k] = firma; dirty = true; analyze(m, silent); }
+      else if (!streaming && m.state !== 'en-generacion' && p.analyzed[k] !== firma) { p.analyzed[k] = firma; dirty = true; analyze(m, silent); }
     });
     return dirty;
   }
@@ -381,7 +381,7 @@
       const d = detectInfo, estado = d.status === 'fallido' ? '❌ DETECCIÓN FALLIDA' : d.status === 'parcial' ? '⚠ ANÁLISIS PARCIAL (solo lo cargado en el DOM)' : '✓ Cobertura: DOM disponible completo (no garantiza mensajes fuera del DOM)';
       refs.detect.textContent = [
         `${estado} · conversación: ${d.conversationId}`,
-        `Contenedor de conversación: ${d.containerFound ? d.container : 'no encontrado'} · ámbito de búsqueda: ${d.scope || 'main'} · observadores: ${detectionActive ? `estructura ${structObserver ? 'activo' : 'inactivo'} · mensajes ${msgObserver ? 'activo (' + (d.container || '') + ')' : 'sin contenedor'}` : 'detenidos'}`,
+        `Contenedor de conversación: ${d.containerFound ? d.container : 'no encontrado'} · fuente: ${d.fuente === 'json-embebido' ? 'JSON embebido en el código de la página (foto inicial)' : 'DOM visible'} · ámbito de búsqueda: ${d.scope || 'main'} · observadores: ${detectionActive ? `estructura ${structObserver ? 'activo' : 'inactivo'} · mensajes ${msgObserver ? 'activo (' + (d.container || '') + ')' : 'sin contenedor'}` : 'detenidos'}`,
         `Total únicos: ${d.total} · usuario: ${d.user} · IA: ${d.assistant} · con código: ${d.withCode}`,
         `Caracteres: ${d.chars.toLocaleString()} · tokens estimados: ${d.tokens.toLocaleString()}`,
         `Estrategia: ${d.strategy} · por selector: ${Object.entries(d.selectorCounts || {}).map(([k, v]) => `${k}=${v}`).join(', ')}`,

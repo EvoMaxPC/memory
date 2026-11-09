@@ -256,4 +256,45 @@ assert.ok(d.scope.includes('documento'), 'el ámbito debe informar que se ampli�
 assert.deepStrictEqual([d.user, d.assistant], [1, 1]);
 ok('Mensajes fuera del primer <main>: el ámbito se amplía y se detectan (fallo de «todo 0»)');
 
-console.log(`\nTodas las pruebas de detección pasaron (${n}/15).`);
+// 16. Interfaz actual: línea de tiempo (timeline) con unidades «…:user» / «…:assistant» y línea oculta
+global.location.pathname = '/c/conv-actual';
+const docT = makeDoc([]);
+const timeline = el('div', { 'data-app-action-timeline-scroll': '', role: 'region' }, '', [
+  el('div', { 'data-turn-key': 'nodo-u1' }, '', [el('div', { 'data-content-search-unit-key': 'fallback-turn-0:0:user', 'data-chatgpt-search-message-ids': 'real-u1' }, 'Pregunta en la interfaz actual')]),
+  el('div', { 'data-turn-key': 'nodo-a1' }, '', [el('div', { 'data-content-search-unit-key': 'fallback-turn-0:1:assistant', 'data-chatgpt-search-message-ids': 'real-a1 real-a1' }, 'Respuesta en la interfaz actual')]),
+  el('div', { role: 'presentation', 'aria-hidden': 'true' }, '', [el('div', { 'data-user-message-bubble': 'true' }, 'Duplicado oculto de navegación')])
+]);
+docT._main.appendChild(timeline);
+global.document = docT;
+d = A.detect();
+assert.strictEqual(d.scope, 'timeline de la conversación');
+assert.strictEqual(d.total, 2, 'la línea oculta no duplica: ' + JSON.stringify(d.messages.map((m) => m.text)));
+assert.deepStrictEqual([d.user, d.assistant], [1, 1], 'rol por sufijo de la unidad (:user/:assistant)');
+assert.strictEqual(d.messages[1].id, 'msg:real-a1', 'id real desde data-chatgpt-search-message-ids');
+assert.ok(d.ocultos >= 1, 'el descarte de ocultos queda informado');
+ok('Interfaz actual: timeline + unidades con rol por sufijo, sin contar la línea oculta');
+
+// 17. Fuente desde el código de la página: JSON embebido (mapping) cuando el DOM no entrega mensajes
+global.location.pathname = '/c/conv-json';
+const docJ = makeDoc([]);
+const payload = {
+  conversation_id: 'conv-json', current_node: 'n2',
+  mapping: {
+    root: { id: 'root', parent: null, children: ['n1'], message: null },
+    n1: { id: 'n1', parent: 'root', children: ['n2'], message: { id: 'ju1', author: { role: 'user' }, create_time: 1700000000, status: 'finished_successfully', content: { content_type: 'text', parts: ['Pregunta desde el código de la página'] } } },
+    n2: { id: 'n2', parent: 'n1', children: [], message: { id: 'ja1', author: { role: 'assistant' }, create_time: 1700000060, status: 'finished_successfully', content: { content_type: 'code', language: 'js', text: 'console.log(1);' } } },
+    sys: { id: 'sys', parent: 'root', children: [], message: { id: 's0', author: { role: 'system' }, content: { content_type: 'text', parts: ['interno'] } } }
+  }
+};
+docJ._main.parentElement.appendChild(el('script', { type: 'application/json' }, JSON.stringify(payload)));
+global.document = docJ;
+d = A.detect();
+assert.strictEqual(d.fuente, 'json-embebido');
+assert.strictEqual(d.total, 2, 'solo user/assistant de la rama actual, en orden');
+assert.strictEqual(d.messages[0].text, 'Pregunta desde el código de la página');
+assert.strictEqual(d.messages[1].code[0].code, 'console.log(1);');
+assert.strictEqual(d.messages[1].conversationId, 'conv-json');
+assert.strictEqual(d.status, 'parcial', 'la foto embebida se informa como parcial, no como lectura completa en vivo');
+ok('JSON embebido en el código de la página: orden por rama, roles, código y asociación a la conversación');
+
+console.log(`\nTodas las pruebas de detección pasaron (${n}/17).`);

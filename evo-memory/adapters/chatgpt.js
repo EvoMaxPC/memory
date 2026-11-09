@@ -28,13 +28,17 @@
     { name: 'turn-id', sel: '[data-turn-id]', kind: 'turn' },
     { name: 'turn-key', sel: '[data-turn-key]', kind: 'turn' },
     { name: 'search-unit', sel: '[data-content-search-unit-key]', kind: 'turn' },
+    { name: 'chatgpt-search-unit', sel: '[data-chatgpt-search-unit-key]', kind: 'turn' },
+    { name: 'search-turn-key', sel: '[data-content-search-turn-key]', kind: 'turn' },
     { name: 'user-bubble', sel: '[data-user-message-bubble]', kind: 'direct' },
     { name: 'conversation-role', sel: '[data-conversation-role]', kind: 'direct' },
+    { name: 'message-role', sel: '[data-message-role]', kind: 'direct' },
     { name: 'agent-turn', sel: '[data-chatgpt-agent-turn-start]', kind: 'turn' },
     { name: 'assistant-markdown', sel: '[data-markdown-text-style="assistant-message"]', kind: 'direct' },
+    { name: 'assistant-markdown-2', sel: '[data-assistant-markdown]', kind: 'direct' },
     { name: 'transcript', sel: 'li[data-message-role]', kind: 'transcript' }
   ];
-  const INNER_MESSAGE_SEL = '[data-message-author-role], [data-conversation-role], [data-message-role], [data-user-message-bubble], [data-markdown-text-style="assistant-message"]';
+  const INNER_MESSAGE_SEL = '[data-message-author-role], [data-conversation-role], [data-message-role], [data-user-message-bubble], [data-markdown-text-style="assistant-message"], [data-assistant-markdown], [data-content-search-unit-key], [data-chatgpt-search-unit-key]';
   const ID_ATTRS = ['data-message-id', 'data-turn-key', 'data-content-search-unit-key', 'data-turn-id'];
   const COMPOSERS = [
     ['prompt-textarea', '#prompt-textarea'],
@@ -61,9 +65,17 @@
   };
   const validRole = (r) => (r === 'user' || r === 'assistant' ? r : null);
   // Rol explícito por semántica del atributo/elemento. Sin atributo reconocible -> null (no se inventa).
+  // En la interfaz actual la unidad de búsqueda trae el rol como sufijo de su clave: «…:user» / «…:assistant».
+  const unitKeyRole = (el) => {
+    const k = attr(el, 'data-content-search-unit-key') || attr(el, 'data-chatgpt-search-unit-key') || '';
+    const m = k.match(/[:\-](user|assistant)\s*$/i);
+    return m ? m[1].toLowerCase() : null;
+  };
   const roleOf = (el) => validRole(attr(el, 'data-message-author-role') || attr(el, 'data-conversation-role') || attr(el, 'data-message-role') || attr(el, 'data-turn'))
+    || unitKeyRole(el)
     || (attr(el, 'data-user-message-bubble') !== null ? 'user' : null)
     || (attr(el, 'data-markdown-text-style') === 'assistant-message' ? 'assistant' : null)
+    || (attr(el, 'data-assistant-markdown') !== null ? 'assistant' : null)
     || (attr(el, 'data-chatgpt-agent-turn-start') !== null ? 'assistant' : null);
 
   // Texto visible: en el mensaje individual se usa innerText (conserva saltos, títulos y listas).
@@ -88,6 +100,9 @@
     }).filter((b) => b.code.trim().length);
   }
   function stableId(contentEl, turnEl, role, text, pos, ctx) {
+    // 0) La interfaz actual lista el/los ids reales del mensaje en data-chatgpt-search-message-ids.
+    const mids = attr(contentEl, 'data-chatgpt-search-message-ids') || attr(turnEl, 'data-chatgpt-search-message-ids');
+    if (mids && mids.trim()) return 'msg:' + mids.trim().split(/[\s,]+/)[0];
     // 1) Identificador propio del mensaje (elemento de contenido): es individual, no se comparte.
     for (const a of ID_ATTRS) { const v = attr(contentEl, a); if (v) return (a === 'data-message-id' ? 'msg:' : 'key:' + a + ':') + v; }
     // 2) Identificador del turno/contenedor: si el turno agrupa varios mensajes del mismo rol, se
@@ -145,7 +160,20 @@
   // Unión de TODAS las estrategias, deduplicada por elemento: varios selectores pueden apuntar al
   // mismo mensaje (p. ej. turno y su mensaje interno) y debe contarse una sola vez. El orden final
   // es el orden del documento, no el de los selectores.
+  // ChatGPT deja en el DOM una línea de tiempo oculta (role="presentation", 0×0) y nodos de la
+  // conversación anterior: contarlos mezclaba chats. Solo se leen elementos efectivamente visibles.
+  let hiddenDiscarded = 0;
+  function isVisible(el) {
+    for (let n = el; n; n = n.parentElement) {
+      if (attr(n, 'hidden') !== null || attr(n, 'aria-hidden') === 'true' || attr(n, 'role') === 'presentation') return false;
+      const st = attr(n, 'style') || '';
+      if (/display\s*:\s*none|visibility\s*:\s*hidden/i.test(st)) return false;
+    }
+    try { if (typeof el.checkVisibility === 'function' && !el.checkVisibility()) return false; } catch (e) { /* se conserva */ }
+    return true;
+  }
   function allCandidates(scope) {
+    hiddenDiscarded = 0;
     const byEl = new Map();
     for (const s of STRATEGIES) for (const cand of candidatesFor(s, scope)) if (!byEl.has(cand.contentEl)) byEl.set(cand.contentEl, cand);
     let ordered = [...byEl.values()];
@@ -154,11 +182,78 @@
     const prio = new Map(STRATEGIES.map((s, i) => [s.name, i]));
     ordered = ordered.filter((c) => !ordered.some((o) => o !== c && prio.get(o.strategy) < prio.get(c.strategy)
       && (c.contentEl.contains(o.contentEl) || o.contentEl.contains(c.contentEl))));
+    ordered = ordered.filter((c) => { const v = isVisible(c.contentEl); if (!v) hiddenDiscarded++; return v; });
     try {
       const order = new Map([scope, ...$$('*', scope)].map((e, i) => [e, i]));
       ordered.sort((a, b) => (order.get(a.contentEl) ?? 1e9) - (order.get(b.contentEl) ?? 1e9));
     } catch (e) { /* sin orden disponible: se conserva el orden de descubrimiento */ }
     return ordered;
+  }
+
+  // ---- Fuente alternativa: JSON embebido en el código de la página ----
+  // La página puede traer la conversación en <script> JSON con el formato público de exportación:
+  // {mapping: {nodo: {parent, children, message:{id, author:{role}, content:{parts}, create_time}}}, current_node}.
+  // Se lee SOLO lo ya presente en la página (sin red, sin endpoints internos), solo si el script
+  // corresponde a la conversación de la URL, y solo cuando el DOM no entregó mensajes. Es una foto
+  // de la carga inicial: no refleja mensajes posteriores. Con caché para no re-parsear en cada escaneo.
+  let embeddedCache = { key: '', messages: [] };
+  function embeddedMessage(nodeMsg) {
+    if (!nodeMsg || !nodeMsg.author) return null;
+    const role = validRole(nodeMsg.author.role);
+    if (!role || nodeMsg.weight === 0 || (nodeMsg.metadata && nodeMsg.metadata.is_visually_hidden_from_conversation)) return null;
+    const content = nodeMsg.content || {};
+    let text = '', code = [];
+    if (content.content_type === 'code') { const c = content.text || (content.parts || []).filter((x) => typeof x === 'string').join('\n'); code = c ? [{ lang: content.language || '', code: c }] : []; text = c; }
+    else text = (content.parts || []).map((p) => typeof p === 'string' ? p : (p && typeof p.text === 'string' ? p.text : '')).filter(Boolean).join('\n');
+    if (!text && !code.length) return null;
+    return { id: 'msg:' + (nodeMsg.id || hash(text.slice(0, 160))), role, text, code,
+      timestamp: nodeMsg.create_time ? new Date(nodeMsg.create_time * 1000).toISOString() : null,
+      state: nodeMsg.status && nodeMsg.status.indexOf('in_progress') === 0 ? 'en-generacion' : 'finalizada' };
+  }
+  function branchMessages(conv) {
+    const mapping = conv.mapping || {}, ids = [];
+    if (conv.current_node && mapping[conv.current_node]) { // rama actual: desde current_node hacia la raíz
+      const seen = new Set();
+      for (let cur = conv.current_node; cur && mapping[cur] && !seen.has(cur); cur = mapping[cur].parent) { seen.add(cur); ids.unshift(cur); }
+    } else {
+      let rootId = Object.keys(mapping).find((k) => mapping[k] && mapping[k].parent == null);
+      const seen = new Set();
+      for (let cur = rootId; cur && mapping[cur] && !seen.has(cur);) { seen.add(cur); ids.push(cur); const ch = mapping[cur].children || []; cur = ch[ch.length - 1]; }
+    }
+    return ids.map((id) => embeddedMessage(mapping[id] && mapping[id].message)).filter(Boolean);
+  }
+  function collectConversations(rootObj, out) {
+    const seen = new Set(), stack = [rootObj];
+    let budget = 40000;
+    while (stack.length && budget-- > 0) {
+      const o = stack.pop();
+      if (!o || typeof o !== 'object' || seen.has(o)) continue;
+      seen.add(o);
+      if (o.mapping && typeof o.mapping === 'object' && (o.current_node || o.conversation_id || o.title !== undefined)) out.push(o);
+      for (const v of Object.values(o)) if (v && typeof v === 'object') stack.push(v);
+    }
+    return out;
+  }
+  function extractEmbedded(conversationId) {
+    let scripts = [];
+    try { scripts = $$('script').filter((s) => (s.textContent || '').includes('"mapping"')); } catch (e) { return []; }
+    const key = conversationId + ':' + scripts.reduce((a, s) => a + (s.textContent || '').length, 0);
+    if (embeddedCache.key === key) return embeddedCache.messages;
+    let found = [];
+    for (const s of scripts) {
+      const raw = (s.textContent || '').trim();
+      if (conversationId !== 'nueva' && !raw.includes(conversationId)) continue; // debe ser de ESTA conversación
+      let data;
+      try { data = JSON.parse(raw); } catch (e) { continue; } // scripts JS (no JSON) se ignoran, sin inventar parseos
+      for (const conv of collectConversations(data, [])) {
+        if (conv.conversation_id && conversationId !== 'nueva' && conv.conversation_id !== conversationId) continue;
+        const msgs = branchMessages(conv);
+        if (msgs.length) { found = msgs; break; }
+      }
+      if (found.length) break;
+    }
+    embeddedCache = { key, messages: found };
+    return found;
   }
 
   function detect() {
@@ -168,7 +263,14 @@
     // mensajes visibles en la página y todos los contadores en 0.
     let scope = scopeRoot(), scopeName = scope === document ? 'documento' : 'main';
     const hits = (sc) => { try { return STRATEGIES.reduce((a, s) => a + $$(s.sel, sc).length, 0); } catch (e) { return 0; } };
-    if (scope !== document && hits(scope) === 0 && hits(document) > 0) { scope = document; scopeName = 'documento (el <main> no contenía mensajes)'; }
+    // Ámbito preferido en la interfaz actual: la línea de tiempo desplazable de la conversación.
+    // Acota la lectura a la conversación visible y deja fuera la línea oculta de navegación.
+    try {
+      const timelines = $$('[data-app-action-timeline-scroll][role="region"], [data-app-action-timeline-scroll]', document);
+      const tl = timelines.find((t) => hits(t) > 0);
+      if (tl) { scope = tl; scopeName = 'timeline de la conversación'; }
+    } catch (e) { /* sin línea de tiempo: se sigue con main/documento */ }
+    if (scopeName === 'main' && hits(scope) === 0 && hits(document) > 0) { scope = document; scopeName = 'documento (el <main> no contenía mensajes)'; }
     const selectorCounts = {};
     const conversationId = (location.pathname.match(/\/c\/([\w-]+)/) || [])[1] || 'nueva';
     for (const s of STRATEGIES) { try { selectorCounts[s.name] = $$(s.sel, scope).length; } catch (e) { selectorCounts[s.name] = 0; } }
@@ -208,8 +310,15 @@
     messages = [...byId.values()]; chosenEls = [...elsById.values()];
     for (const [id, el] of elsById) elIdentity.set(el, id);
     if (messages.length) prevFingerprintRegistry = fpNow;
-    const strategy = messages.length ? [...usedStrategies].join('+') : 'ninguna';
-    lastContainer = commonContainer(chosenEls, scope);
+    let strategy = messages.length ? [...usedStrategies].join('+') : 'ninguna', fuente = 'dom';
+    if (!messages.length) { // el DOM no entregó nada: se intenta el JSON embebido en el código de la página
+      const emb = extractEmbedded(conversationId);
+      if (emb.length) {
+        fuente = 'json-embebido'; strategy = 'json-embebido-en-la-pagina';
+        messages = emb.map((m) => ({ ...m, uid: conversationId + '::' + m.id, conversationId }));
+      }
+    }
+    lastContainer = fuente === 'dom' ? commonContainer(chosenEls, scope) : null;
     const chars = messages.reduce((a, m) => a + m.text.length, 0);
     const tokens = EVO.estimateTokens ? messages.reduce((a, m) => a + EVO.estimateTokens(m.text), 0) : Math.ceil(chars / 4);
     const reasons = [];
@@ -227,8 +336,10 @@
       if (unclassified) reasons.push(`${unclassified} elemento(s) sin rol reconocible fueron omitidos (no se les inventó un rol).`);
       if (skippedEmpty) reasons.push(`${skippedEmpty} elemento(s) vacíos o de carga fueron omitidos.`);
       if (!lastContainer) reasons.push('Se encontraron mensajes pero ningún ancestro común los contiene a todos: no se pudo fijar un contenedor de conversación observable (la estructura puede haber cambiado).');
+      if (hiddenDiscarded) reasons.push(`${hiddenDiscarded} elemento(s) ocultos (línea de tiempo de navegación o conversación anterior) fueron descartados.`);
+      if (fuente === 'json-embebido') reasons.push('El DOM no entregó mensajes reconocibles: estos mensajes se leyeron del JSON embebido en el código de la página (foto de la carga inicial). Pueden faltar mensajes posteriores y no hay contenedor observable hasta que el DOM los monte.');
       status = reasons.length && (streaming || messages[0].role === 'assistant') ? 'parcial' : 'dom-completo';
-      if (status === 'dom-completo' && (unclassified || skippedEmpty || !lastContainer)) status = 'parcial';
+      if (status === 'dom-completo' && (unclassified || skippedEmpty || !lastContainer || fuente !== 'dom')) status = 'parcial';
     }
     lastDetect = {
       ok: messages.length > 0, status, historialIncompleto: status === 'parcial', strategy, messages,
@@ -236,7 +347,7 @@
       user: messages.filter((m) => m.role === 'user').length,
       assistant: messages.filter((m) => m.role === 'assistant').length,
       withCode: messages.filter((m) => m.code.length).length,
-      chars, tokens, selectorCounts, duplicates, unclassified, skippedEmpty, reconciliados,
+      chars, tokens, selectorCounts, duplicates, unclassified, skippedEmpty, reconciliados, ocultos: hiddenDiscarded, fuente,
       streaming: messages.length ? stopButtons().length > 0 : false,
       containerFound: !!lastContainer, container: describeEl(lastContainer), scope: scopeName, probes,
       conversationId: (location.pathname.match(/\/c\/([\w-]+)/) || [])[1] || 'nueva',
@@ -300,7 +411,7 @@
       mensajes_con_codigo: d.withCode,
       caracteres: d.chars, tokens_estimados: d.tokens,
       duplicados_descartados: d.duplicates, sin_rol_omitidos: d.unclassified, vacios_omitidos: d.skippedEmpty,
-      reconciliados: d.reconciliados, contenedor_conversacion: d.container, cobertura: d.status, ambito_busqueda: d.scope, sondeo: d.probes,
+      reconciliados: d.reconciliados, contenedor_conversacion: d.container, cobertura: d.status, ambito_busqueda: d.scope, sondeo: d.probes, fuente: d.fuente, ocultos_descartados: d.ocultos || 0,
       cuadro_texto: c ? c.n : 'NO ENCONTRADO',
       transmitiendo: stopButtons().length > 0,
       botones_detener: stopButtons().map((b) => b.getAttribute('aria-label') || b.getAttribute('data-testid')),
