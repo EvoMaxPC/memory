@@ -360,6 +360,10 @@
     return out;
   }
   function extractEmbedded(conversationId) {
+    // Un chat nuevo todavía no tiene ID verificable. La página puede conservar en su estado
+    // inicial datos de la conversación anterior: aceptarlos contaría mensajes de otro chat.
+    // En «nueva» la lectura es solo DOM hasta que ChatGPT asigne el ID real de la conversación.
+    if (!conversationId || conversationId === 'nueva') return [];
     let scripts = [];
     try { scripts = $$('script').filter((s) => (s.textContent || '').includes('"mapping"')); } catch (e) { return []; }
     const key = conversationId + ':' + scripts.reduce((a, s) => a + (s.textContent || '').length, 0);
@@ -403,11 +407,29 @@
     if (scopeName === 'main' && hits(scope) === 0 && hits(document) > 0) { scope = document; scopeName = 'documento (el <main> no contenía mensajes)'; }
     const selectorCounts = {};
     const conversationId = currentConversationId();
-    for (const s of STRATEGIES) { try { selectorCounts[s.name] = $$(s.sel, scope).length; } catch (e) { selectorCounts[s.name] = 0; } }
+    const fillSelectorCounts = () => { for (const s of STRATEGIES) { try { selectorCounts[s.name] = $$(s.sel, scope).length; } catch (e) { selectorCounts[s.name] = 0; } } };
+    fillSelectorCounts();
     let probes = {};
     try { probes = { article: $$('article', document).length, conTestid: $$('[data-testid]', document).length, conRol: $$('[data-message-author-role], [data-conversation-role], [data-message-role]', document).length }; } catch (e) { /* sondeo no disponible */ }
     let messages = [], chosenEls = [], duplicates = 0, unclassified = 0, skippedEmpty = 0, reconciliados = 0;
-    const cands = allCandidates(scope);
+    let cands = allCandidates(scope);
+    // El conteo crudo por selector no garantiza mensajes: una línea de tiempo puede tener
+    // aciertos y aun así no entregar ningún candidato con rol (p. ej. quedó seleccionada la
+    // conversación anterior inactiva al abrir un chat nuevo). Antes de contar, se rescata el
+    // primer ámbito que sí entregue mensajes clasificados de la conversación visible.
+    if (!cands.some((c) => c.role)) {
+      const alternatives = [];
+      const addAlt = (sc, name) => { if (sc && !alternatives.some(([x]) => x === sc)) alternatives.push([sc, name]); };
+      addAlt(activeRoot, 'página activa de la conversación');
+      const rootScope = scopeRoot(); addAlt(rootScope, rootScope === document ? 'documento' : 'main');
+      addAlt(document, 'documento (rescate: el ámbito inicial no entregó mensajes clasificados)');
+      for (const [altScope, altName] of alternatives) {
+        if (altScope === scope) continue;
+        const altCands = allCandidates(altScope);
+        if (altCands.some((c) => c.role)) { scope = altScope; scopeName = altName; cands = altCands; fillSelectorCounts(); break; }
+        if (!cands.length && altCands.length) { scope = altScope; scopeName = altName; cands = altCands; fillSelectorCounts(); }
+      }
+    }
     const turnRoleTotal = new Map(), turnRoleSeen = new Map();
     for (const c of cands) { // cuántos mensajes del mismo rol comparten cada turno (para no fusionarlos)
       if (!c.role) continue;
@@ -501,6 +523,10 @@
       }
     } else messages = domMessages.map((m) => ({ ...m, source: 'dom' }));
     const jsonSolo = fuente === 'dom+json' ? jsonTotal - coincidentes : fuente === 'json-embebido' ? jsonTotal : 0;
+    // Garantía final del contador: el registro que ve el panel no puede contener dos veces
+    // el mismo uid, venga la repetición del DOM, del JSON o de la combinación de fuentes.
+    const seenUid = new Set();
+    messages = messages.filter((m) => { if (seenUid.has(m.uid)) { duplicates++; return false; } seenUid.add(m.uid); return true; });
     for (const [id, el] of elsById) { // la identidad del elemento queda con el id canónico del registro único
       const dm = domMessages.find((m) => m.id === id);
       const reg = dm && messages.find((m) => m.text === dm.text && m.role === dm.role && (m.source === 'dom+json' || m.source === 'dom'));

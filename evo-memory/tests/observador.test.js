@@ -218,5 +218,25 @@ const fireStructure = () => { const o = activeObservers().find((x) => x.target =
   assert.strictEqual(main.scrollTop, 1300, 'posición de lectura restaurada exactamente');
   ok('Recuperación de antiguos sin JSON embebido: orden, sin duplicados, posición restaurada e inicio alcanzado');
 
-  console.log(`\nTodas las pruebas del observador pasaron (${n}/8).`);
+  // 9. Chat nuevo: empieza vacío, lee el primer intercambio y conserva el conteo al recibir ID real
+  global.location.pathname = '/';
+  wrapper.remove();
+  const wrapperNuevo = el('section');
+  main.appendChild(wrapperNuevo);
+  fireStructure(); await sleep(1200);
+  assert.ok(leafText('Mensajes leídos: 0'), 'un chat nuevo vacío cuenta 0 y no hereda la conversación anterior: ' + leafText('Mensajes leídos:'));
+  assert.strictEqual(A.lastDetect().conversationId, 'nueva');
+  wrapperNuevo.appendChild(turn(1, 'user', 'n-u1', [txt('Primer mensaje en el chat nuevo')]));
+  wrapperNuevo.appendChild(turn(2, 'assistant', 'n-a1', [txt('Primera respuesta en el chat nuevo')]));
+  fireStructure(); await sleep(1200);
+  assert.ok(leafText('Mensajes leídos: 2'), 'el primer intercambio del chat nuevo se lee en tiempo real: ' + leafText('Mensajes leídos:'));
+  assert.deepStrictEqual(A.getMessages().map((m) => m.text), ['Primer mensaje en el chat nuevo', 'Primera respuesta en el chat nuevo']);
+  global.location.pathname = '/c/conv-nueva-real';
+  fireStructure(); await sleep(1200);
+  assert.ok(leafText('Mensajes leídos: 2'), 'al asignarse el ID real no cambia ni duplica el conteo: ' + leafText('Mensajes leídos:'));
+  assert.strictEqual(A.lastDetect().conversationId, 'conv-nueva-real');
+  assert.ok(A.lastDetect().messages.every((m) => m.uid.startsWith('conv-nueva-real::')), 'los mensajes del chat nuevo quedan asociados a su ID real');
+  ok('Chat nuevo: vacío en 0, primer intercambio leído y mismo conteo al recibir el ID real');
+
+  console.log(`\nTodas las pruebas del observador pasaron (${n}/9).`);
 })().catch((e) => { console.error('FALLÓ:', e); process.exit(1); });

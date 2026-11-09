@@ -439,4 +439,43 @@ assert.strictEqual(d.messages[1].code[0].code, 'const copia = true;\nconsole.log
 assert.ok(!d.messages.some((m) => /ChatGPT said|You said|Copiar|Texto de interfaz|otra conversación|inactiva/.test(m.text)), 'sin rótulos, controles ni mensajes ajenos');
 ok('Lectura exacta: burbuja de usuario + contenido de IA, página activa y conversación actual');
 
-console.log(`\nTodas las pruebas de detección pasaron (${n}/22).`);
+// 23. Chat nuevo sin ID real todavía: el estado JSON retenido de otro chat NO se cuenta
+global.location.pathname = '/';
+const docN = makeDoc([]);
+docN._main.appendChild(turn(1, 'user', 'new-u1', [txt('Primer mensaje del chat nuevo')]));
+docN._main.appendChild(turn(2, 'assistant', 'new-a1', [txt('Primera respuesta del chat nuevo')]));
+const payloadViejo = {
+  conversation_id: 'conv-vieja', current_node: 'v2',
+  mapping: {
+    v1: { id: 'v1', parent: null, children: ['v2'], message: { id: 'viejo-u', author: { role: 'user' }, status: 'finished_successfully', content: { content_type: 'text', parts: ['Mensaje de un chat anterior retenido'] } } },
+    v2: { id: 'v2', parent: 'v1', children: [], message: { id: 'viejo-a', author: { role: 'assistant' }, status: 'finished_successfully', content: { content_type: 'text', parts: ['Respuesta de un chat anterior retenido'] } } }
+  }
+};
+docN._main.parentElement.appendChild(el('script', { type: 'application/json' }, JSON.stringify(payloadViejo)));
+global.document = docN;
+d = A.detect();
+assert.strictEqual(d.conversationId, 'nueva');
+assert.strictEqual(d.total, 2, 'en un chat nuevo se cuentan solo los mensajes ya escritos en ese chat');
+assert.strictEqual(d.fuente, 'dom');
+assert.strictEqual(d.jsonTotal, 0, 'sin ID real no se acepta JSON de otra conversación retenida en la página');
+assert.ok(!d.messages.some((m) => m.text.includes('anterior retenido')), 'ningún mensaje del chat anterior entra al chat nuevo');
+ok('Chat nuevo: solo DOM hasta tener ID real; el JSON retenido de otro chat no contamina el conteo');
+
+// 24. Chat nuevo cuando quedó seleccionada la línea de tiempo anterior inactiva: se rescata el ámbito real
+global.location.pathname = '/c/conv-rescate';
+const docR = makeDoc([]);
+docR._main.appendChild(el('div', { 'data-app-shell-active-page': 'false' }, '', [
+  el('div', { 'data-app-action-timeline-scroll': '', role: 'region' }, '', [el('button', { 'data-user-message-bubble': 'true' }, 'Mensaje anterior inactivo')])
+]));
+docR._main.appendChild(el('section', {}, '', [
+  turn(1, 'user', 'r-u1', [txt('Mensaje del chat nuevo visible')]),
+  turn(2, 'assistant', 'r-a1', [txt('Respuesta del chat nuevo visible')])
+]));
+global.document = docR;
+d = A.detect();
+assert.strictEqual(d.total, 2, 'si el ámbito inicial no entrega mensajes clasificados, se lee el ámbito que sí los tiene');
+assert.deepStrictEqual(d.messages.map((m) => m.text), ['Mensaje del chat nuevo visible', 'Respuesta del chat nuevo visible']);
+assert.ok(!d.messages.some((m) => m.text.includes('anterior inactivo')), 'la conversación anterior inactiva no se mezcla');
+ok('Ámbito inicial equivocado: rescate al ámbito con mensajes clasificados de la conversación visible');
+
+console.log(`\nTodas las pruebas de detección pasaron (${n}/24).`);
