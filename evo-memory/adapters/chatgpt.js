@@ -162,6 +162,7 @@
 
   function detect() {
     const scope = scopeRoot(), selectorCounts = {};
+    const conversationId = (location.pathname.match(/\/c\/([\w-]+)/) || [])[1] || 'nueva';
     for (const s of STRATEGIES) { try { selectorCounts[s.name] = $$(s.sel, scope).length; } catch (e) { selectorCounts[s.name] = 0; } }
     let messages = [], chosenEls = [], duplicates = 0, unclassified = 0, skippedEmpty = 0, reconciliados = 0;
     const cands = allCandidates(scope);
@@ -184,7 +185,9 @@
       reconciliados += ctx.reconciliados;
       usedStrategies.add(cand.strategy);
       const timeEl = cand.contentEl.querySelector ? cand.contentEl.querySelector('time') : null;
-      const msg = { id, role: cand.role, text, code, timestamp: attr(timeEl, 'datetime') || null };
+      // Cada mensaje queda asociado a SU conversación y con un uid único entre conversaciones:
+      // el mismo id local (turno/huella) en otro chat nunca se confunde con este.
+      const msg = { id, uid: conversationId + '::' + id, conversationId, role: cand.role, text, code, timestamp: attr(timeEl, 'datetime') || null };
       if (id.startsWith('fp:')) fpNow.push({ id, role: cand.role, ph: hash(text.slice(0, 160)), rolePos: ctx.rolePos });
       if (byId.has(id)) { // mismo mensaje repetido o actualizado: conserva el contenido más completo
         duplicates++;
@@ -217,7 +220,7 @@
       if (status === 'dom-completo' && (unclassified || skippedEmpty || !lastContainer)) status = 'parcial';
     }
     lastDetect = {
-      ok: messages.length > 0, status, strategy, messages,
+      ok: messages.length > 0, status, historialIncompleto: status === 'parcial', strategy, messages,
       total: messages.length,
       user: messages.filter((m) => m.role === 'user').length,
       assistant: messages.filter((m) => m.role === 'assistant').length,

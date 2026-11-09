@@ -214,4 +214,30 @@ assert.strictEqual(d.status, 'fallido');
 assert.ok(d.unclassified >= 1, 'el descarte queda contado como no clasificado');
 ok('Sin rol semántico: no se inventa autor y el diagnóstico lo informa');
 
-console.log(`\nTodas las pruebas de detección pasaron (${n}/13).`);
+// 14. Asociación por conversación y unicidad entre conversaciones distintas
+function docSimple() {
+  const dd = makeDoc([]);
+  dd._main.appendChild(el('article', { 'data-turn': 'user' }, '', [txt('Misma pregunta en dos chats')]));
+  dd._main.appendChild(el('article', { 'data-turn': 'assistant' }, '', [txt('Misma respuesta:'), el('pre', {}, '', [el('code', { class: 'language-js' }, 'let a = 1;')])]));
+  return dd;
+}
+global.location.pathname = '/c/conv-a';
+const docA = docSimple(); global.document = docA;
+const dA = A.detect();
+global.location.pathname = '/c/conv-b';
+global.document = docSimple();
+const dB = A.detect();
+assert.ok(dA.messages.every((m) => m.conversationId === 'conv-a' && m.uid.startsWith('conv-a::')));
+assert.ok(dB.messages.every((m) => m.conversationId === 'conv-b' && m.uid.startsWith('conv-b::')));
+assert.notStrictEqual(dA.messages[0].uid, dB.messages[0].uid, 'mismo id local en chats distintos = registros distintos');
+assert.strictEqual(new Set([...dA.messages, ...dB.messages].map((m) => m.uid)).size, 4, 'uids únicos entre conversaciones');
+// Regreso a la conversación A: mismos registros, texto y código íntegros
+global.location.pathname = '/c/conv-a';
+global.document = docA;
+const dA2 = A.detect();
+assert.deepStrictEqual(dA2.messages.map((m) => m.uid), dA.messages.map((m) => m.uid));
+assert.strictEqual(dA2.messages[1].code[0].code, 'let a = 1;');
+assert.strictEqual(dA2.messages[0].text, 'Misma pregunta en dos chats');
+ok('Cada mensaje asociado a su conversación, uid único entre chats y regreso sin mezclar');
+
+console.log(`\nTodas las pruebas de detección pasaron (${n}/14).`);

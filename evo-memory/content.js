@@ -23,7 +23,7 @@
   const newProject = (name) => EVO.ProjectStorage ? EVO.ProjectStorage.createProjectData(name)
     : ({ name, objective: '', nextStep: '', decisions: [], rules: [], failed: [], seen: {}, convs: {}, errFp: {}, code: [], alerts: [] });
   let S, ctx = 0, lastSig = '', lastConv = '', timer, stable = 0, nMsgs = 0, scans = 0, lastError = '', pendingChange = null;
-  let detectInfo = null, lastIngest = { nuevos: 0, actualizados: 0, manual: false };
+  let detectInfo = null, lastIngest = { nuevos: 0, antiguos: 0, actualizados: 0, manual: false };
   // Motor en tiempo real: activo hasta que el usuario lo detiene (conserva el autoescaneo histórico).
   let detectionActive = true, msgObserver = null, structObserver = null, obsContainer = null, obsConv = '';
   let convState = 'esperando', lastUpdate = null, lastChangeAt = 0, procTimer = null, structTimer = null;
@@ -75,31 +75,51 @@
   // (nunca se analiza una respuesta incompleta como definitiva) y solo una vez por versión final:
   // `analyzed` guarda la firma ya analizada, así la versión final conserva sus bloques de código
   // sin generar alertas ni registros duplicados por cada fragmento intermedio.
-  function ingest(msgs, silent, streaming) {
+  function ingest(msgs, silent, streaming, cid) {
     const p = P();
     if (!p.analyzed || typeof p.analyzed !== 'object') p.analyzed = {};
-    ctx = 0; let dirty = false; lastIngest = { nuevos: 0, actualizados: 0, manual: lastIngest.manual };
-    for (const m of msgs) {
+    // Clave de registro POR CONVERSACIÓN: el mismo id local en otro chat es otro registro.
+    const key = (m) => (m.uid || (cid + '::' + m.id));
+    // Foto previa de lo ya registrado en ESTA conversación: un mensaje no registrado que aparece
+    // ANTES de otros ya conocidos es un antiguo cargado posteriormente, no un mensaje nuevo.
+    const knownBefore = new Set(msgs.filter((m) => p.seen[key(m)] !== undefined || p.seen[m.id] !== undefined).map((m) => key(m)));
+    ctx = 0; let dirty = false; lastIngest = { nuevos: 0, antiguos: 0, actualizados: 0, manual: lastIngest.manual };
+    msgs.forEach((m, i) => {
       ctx += EVO.estimateTokens(m.text);
-      const firma = m.text.length + ':' + contentHash(m.text) + ':' + m.code.map((b) => contentHash(b.code)).join(',');
-      if (!p.seen[m.id]) { p.seen[m.id] = firma; dirty = true; lastIngest.nuevos++; }
-      else if (p.seen[m.id] !== firma && p.seen[m.id] !== 1) { p.seen[m.id] = firma; dirty = true; lastIngest.actualizados++; }
-      else if (p.seen[m.id] === 1) { p.seen[m.id] = firma; dirty = true; } // formato viejo (solo presencia)
+      const k = key(m), firma = m.text.length + ':' + contentHash(m.text) + ':' + m.code.map((b) => contentHash(b.code)).join(',');
+      if (p.seen[k] === undefined && p.seen[m.id] !== undefined) { p.seen[k] = p.seen[m.id]; dirty = true; } // registro de versiones anteriores, sin alcance
+      if (p.analyzed[k] === undefined && p.analyzed[m.id] !== undefined) p.analyzed[k] = p.analyzed[m.id];
+      if (!p.seen[k]) {
+        p.seen[k] = firma; dirty = true;
+        if (knownBefore.size && msgs.slice(i + 1).some((o) => knownBefore.has(key(o)))) lastIngest.antiguos++;
+        else lastIngest.nuevos++;
+      }
+      else if (p.seen[k] !== firma && p.seen[k] !== 1) { p.seen[k] = firma; dirty = true; lastIngest.actualizados++; }
+      else if (p.seen[k] === 1) { p.seen[k] = firma; dirty = true; } // formato viejo (solo presencia)
       else dupEvitados++; // mismo id y mismo contenido: duplicado evitado, no se reprocesa
-      if (m.role === 'user') { if (!p.analyzed[m.id]) { p.analyzed[m.id] = firma; dirty = true; analyze(m, silent); } }
-      else if (!streaming && p.analyzed[m.id] !== firma) { p.analyzed[m.id] = firma; dirty = true; analyze(m, silent); }
-    }
+      if (m.role === 'user') { if (!p.analyzed[k]) { p.analyzed[k] = firma; dirty = true; analyze(m, silent); } }
+      else if (!streaming && p.analyzed[k] !== firma) { p.analyzed[k] = firma; dirty = true; analyze(m, silent); }
+    });
     return dirty;
+  }
+  // Al chat nuevo ChatGPT le asigna su id real después: los registros «nueva::*» pasan a ese id
+  // para que los mismos mensajes no se reprocesen como si fueran otros.
+  function migrateNewChatKeys(p, msgs, cid) {
+    for (const m of msgs) {
+      const oldK = 'nueva::' + m.id, newK = cid + '::' + m.id;
+      if (p.seen[oldK] !== undefined && p.seen[newK] === undefined) p.seen[newK] = p.seen[oldK];
+      if (p.analyzed && p.analyzed[oldK] !== undefined && p.analyzed[newK] === undefined) p.analyzed[newK] = p.analyzed[oldK];
+    }
   }
   function applyDetect(d, manual) {
     const p = P(), cid = A.conversationId();
-    if (lastConv === 'nueva' && cid !== 'nueva') p.convs[cid] = 1; // el chat nuevo recibió su id real
+    if (lastConv === 'nueva' && cid !== 'nueva') { p.convs[cid] = 1; migrateNewChatKeys(p, d.messages, cid); } // el chat nuevo recibió su id real
     lastConv = cid;
     const silent = !p.convs[cid]; // al abrir un chat antiguo se aprende del historial sin lanzar alertas
     detectInfo = d; nMsgs = d.total;
     lastIngest.manual = !!manual;
     wasStreaming = !!(d.streaming || A.isStreaming());
-    let dirty = ingest(d.messages, silent, wasStreaming);
+    let dirty = ingest(d.messages, silent, wasStreaming, cid);
     if (d.messages.length && !p.convs[cid]) { p.convs[cid] = 1; dirty = true; }
     if (dirty) save();
     lastSig = d.messages.length + ':' + (d.messages.length ? d.messages[d.messages.length - 1].text.length : 0);
@@ -170,7 +190,7 @@
     detectionActive = true;
     obsConv = A.conversationId();
     attachStructureObserver();
-    lastIngest = { nuevos: 0, actualizados: 0, manual: !!manual };
+    lastIngest = { nuevos: 0, antiguos: 0, actualizados: 0, manual: !!manual };
     try {
       const d = runDetect(!!manual); // escaneo inmediato y completo de lo disponible en el DOM
       applyDetect(d, !!manual);
@@ -365,7 +385,7 @@
         `Total únicos: ${d.total} · usuario: ${d.user} · IA: ${d.assistant} · con código: ${d.withCode}`,
         `Caracteres: ${d.chars.toLocaleString()} · tokens estimados: ${d.tokens.toLocaleString()}`,
         `Estrategia: ${d.strategy} · por selector: ${Object.entries(d.selectorCounts || {}).map(([k, v]) => `${k}=${v}`).join(', ')}`,
-        `Nuevos: ${lastIngest.nuevos} · actualizados: ${lastIngest.actualizados} · duplicados evitados (sesión): ${dupEvitados} · en este escaneo: ${d.duplicates} · reconciliados: ${d.reconciliados || 0}${lastIngest.manual ? ' · (escaneo manual)' : ''}`,
+        `Nuevos: ${lastIngest.nuevos} · antiguos incorporados: ${lastIngest.antiguos || 0} · actualizados: ${lastIngest.actualizados} · duplicados evitados (sesión): ${dupEvitados} · en este escaneo: ${d.duplicates} · reconciliados: ${d.reconciliados || 0}${lastIngest.manual ? ' · (escaneo manual)' : ''}`,
         `Descartados: vacíos/carga ${d.skippedEmpty} · sin rol ${d.unclassified} · errores de lectura: ${erroresLectura}${lastError ? ' · último error: ' + lastError : ''}`,
         ...(d.reasons || []).map((r) => '• ' + r),
         'La lectura cubre solo los mensajes presentes en el DOM; si ChatGPT no cargó el historial completo, el análisis es parcial. Ningún mensaje detectado se convierte solo en decisión confirmada ni toca los datos protegidos.'

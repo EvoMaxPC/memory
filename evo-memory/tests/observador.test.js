@@ -181,5 +181,19 @@ const fireStructure = () => { const o = activeObservers().find((x) => x.target =
   assert.strictEqual(activeObservers().length, 2, 'inicios repetidos no acumulan observadores');
   ok('Detener conserva y desconecta; reiniciar recupera con un único ciclo activo');
 
-  console.log(`\nTodas las pruebas del observador pasaron (${n}/6).`);
+  // 7. Regreso a la primera conversación: se recupera sin mezclar, sin reprocesar y con antiguos
+  global.location.pathname = '/c/conv-1';
+  wrapper2.remove();
+  wrapper.prepend(turn(0, 'user', 'c1-u0', [txt('Antiguo cargado al volver')]));
+  main.appendChild(wrapper);
+  fireStructure(); await sleep(1200);
+  assert.ok(leafText('Detectados: 5 mensajes'), 'al volver se recupera la conversación original completa: ' + leafText('Detectados:'));
+  assert.ok(leafText('conv-1'));
+  assert.ok(leafText('antiguos incorporados: 1'), 'el antiguo prependido se clasifica como antiguo, no nuevo: ' + leafText('antiguos'));
+  assert.ok(leafText('Nuevos: 0'), 'lo ya registrado en esta conversación no se reprocesa');
+  const recuperado = A.getMessages().find((m) => m.id === 'msg:c1-a2');
+  assert.ok(recuperado && recuperado.code[0].code === 'const x = 1;' && recuperado.text.includes('código'), 'texto y código íntegros al regresar');
+  ok('Regreso a una conversación: registros recuperados, separados y sin duplicar');
+
+  console.log(`\nTodas las pruebas del observador pasaron (${n}/7).`);
 })().catch((e) => { console.error('FALLÓ:', e); process.exit(1); });
