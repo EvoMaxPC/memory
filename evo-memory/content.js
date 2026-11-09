@@ -26,7 +26,7 @@
   let detectInfo = null, lastIngest = { nuevos: 0, antiguos: 0, actualizados: 0, manual: false };
   // Motor en tiempo real: activo hasta que el usuario lo detiene (conserva el autoescaneo histórico).
   let detectionActive = true, msgObserver = null, structObserver = null, obsContainer = null, obsConv = '';
-  let convState = 'esperando', lastUpdate = null, lastChangeAt = 0, procTimer = null, structTimer = null;
+  let convState = 'esperando', lastUpdate = null, lastChangeAt = 0, procTimer = null, structTimer = null, safetyTimer = null;
   let dupEvitados = 0, erroresLectura = 0, mutPendientes = 0, wasStreaming = false;
   let recovering = false; const integrityByConv = {}; // integridad del historial por conversación
   const waitMs = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -170,32 +170,47 @@
     });
     msgObserver.observe(cont, { childList: true, subtree: true, characterData: true });
   }
+  // Reconciliación de conversación/contenedor: la usan el observador de estructura y la
+  // verificación periódica de seguridad. Si ChatGPT cambia de chat reemplazando nodos, si
+  // la URL cambia sin una mutación útil o si el observador de mensajes quedó mirando un
+  // contenedor viejo, esta función re-descubre la conversación visible y re-escanea.
+  function reconcileConversation() {
+    if (!detectionActive) return;
+    const cid = A.conversationId();
+    const contOk = obsContainer && document.contains(obsContainer);
+    if (cid !== obsConv) { // cambio de conversación: separar registros y re-observar, sin borrar nada
+      obsConv = cid; obsContainer = null;
+      if (msgObserver) { msgObserver.disconnect(); msgObserver = null; }
+      lastSig = ''; convState = 'esperando';
+      say('Conversación cambiada: se leen solo los mensajes de esta conversación; los anteriores se conservan.');
+      scan();
+    } else if (!contOk) { obsContainer = null; scan(); } // contenedor reconstruido, chat nuevo o mensajes recién cargados
+    else if (A.isStreaming() !== wasStreaming) schedule(); // apareció/desapareció la señal de generación: reevaluar y, si terminó, analizar la versión final
+  }
+  // Verificación de seguridad de baja frecuencia: no reemplaza a los observadores; evita que
+  // una conversación nueva quede sin leer si una mutación no llegó o el contenedor cambió.
+  function ensureSafetyTimer() {
+    if (safetyTimer) return;
+    safetyTimer = setInterval(reconcileConversation, 2500);
+    if (safetyTimer && typeof safetyTimer.unref === 'function') safetyTimer.unref(); // en Node no debe retener el proceso de pruebas
+  }
   // --- Observador de estructura: contenedor reemplazado, navegación SPA y cambios de URL ---
   function attachStructureObserver() {
-    if (structObserver || !document.body) return;
+    if (structObserver || !(document.documentElement || document.body)) return;
     structObserver = new MutationObserver(() => {
       if (!detectionActive) return;
       clearTimeout(structTimer);
-      structTimer = setTimeout(() => { // chequeo barato y agrupado, sin reescanear por cada mutación
-        if (!detectionActive) return;
-        const cid = A.conversationId();
-        const contOk = obsContainer && document.contains(obsContainer);
-        if (cid !== obsConv) { // cambio de conversación: separar registros y re-observar, sin borrar nada
-          obsConv = cid; obsContainer = null;
-          if (msgObserver) { msgObserver.disconnect(); msgObserver = null; }
-          lastSig = ''; convState = 'esperando';
-          say('Conversación cambiada: se leen solo los mensajes de esta conversación; los anteriores se conservan.');
-          scan();
-        } else if (!contOk) { obsContainer = null; scan(); } // contenedor reconstruido o mensajes recién cargados
-        else if (A.isStreaming() !== wasStreaming) schedule(); // apareció/desapareció la señal de generación (p. ej. botón detener fuera del contenedor): reevaluar y, si terminó, analizar la versión final
-      }, 500);
+      structTimer = setTimeout(reconcileConversation, 500); // chequeo agrupado, sin reescanear por cada mutación
     });
-    structObserver.observe(document.body, { childList: true, subtree: true });
+    // Se observa la raíz del documento, no solo <body>: si ChatGPT reemplaza el body o mueve
+    // la conversación fuera del contenedor anterior, el ciclo de descubrimiento sigue vivo.
+    structObserver.observe(document.documentElement || document.body, { childList: true, subtree: true });
   }
   function startDetection(manual) {
     detectionActive = true;
     obsConv = A.conversationId();
     attachStructureObserver();
+    ensureSafetyTimer();
     lastIngest = { nuevos: 0, antiguos: 0, actualizados: 0, manual: !!manual };
     try {
       const d = runDetect(!!manual); // escaneo inmediato y completo de lo disponible en el DOM
@@ -213,6 +228,7 @@
     detectionActive = false; obsContainer = null;
     if (msgObserver) { msgObserver.disconnect(); msgObserver = null; }
     if (structObserver) { structObserver.disconnect(); structObserver = null; }
+    if (safetyTimer) { clearInterval(safetyTimer); safetyTimer = null; }
     clearTimeout(procTimer); clearTimeout(timer); clearTimeout(structTimer);
     render(); // los registros y contadores existentes se conservan
     say('Lectura detenida: no se observan nuevos cambios. Los mensajes ya leídos se conservan.');

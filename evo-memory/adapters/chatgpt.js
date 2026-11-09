@@ -390,46 +390,53 @@
     // del documento sí, se busca en el documento completo (p. ej. si ChatGPT movió la conversación
     // fuera del primer <main>). Quedarse solo con un <main> vacío fue un fallo real reportado:
     // mensajes visibles en la página y todos los contadores en 0.
+    // Selección estratégica del ámbito: NO se elige por aciertos crudos de selectores.
+    // Se evalúan ámbitos en orden de confianza y se usa el primero que entregue mensajes
+    // utilizables (rol + contenido real) tras descartar ocultos, navegación, página inactiva y
+    // otras conversaciones. Así, al abrir un chat nuevo, una línea de tiempo anterior con
+    // aciertos pero sin mensajes válidos no puede fijar el conteo en 0 ni mezclar otro chat.
     let scope = scopeRoot(), scopeName = scope === document ? 'documento' : 'main';
-    // Al cambiar de chat dentro de la app, ChatGPT puede conservar la conversación anterior
-    // en una página inactiva del DOM. Si hay página activa marcada, SOLO se lee esa.
     let activeRoot = null;
     try { activeRoot = outer($$('[data-app-shell-active-page="true"]', document)).filter((e) => !inEvo(e))[0] || null; } catch (e) { /* sin marca de página activa */ }
-    if (activeRoot) { scope = activeRoot; scopeName = 'página activa de la conversación'; }
-    const hits = (sc) => { try { return STRATEGIES.reduce((a, s) => a + $$(s.sel, sc).length, 0); } catch (e) { return 0; } };
-    // Ámbito preferido en la interfaz actual: la línea de tiempo desplazable de la conversación.
-    // Acota la lectura a la conversación visible y deja fuera la línea oculta de navegación.
+    const scopeOptions = [];
+    const addScope = (sc, name) => { if (sc && !scopeOptions.some((o) => o.scope === sc)) scopeOptions.push({ scope: sc, name }); };
     try {
       const timelines = $$('[data-app-action-timeline-scroll][role="region"], [data-app-action-timeline-scroll]', activeRoot || document);
-      const tl = timelines.find((t) => hits(t) > 0);
-      if (tl) { scope = tl; scopeName = activeRoot ? 'timeline de la página activa' : 'timeline de la conversación'; }
-    } catch (e) { /* sin línea de tiempo: se sigue con main/documento */ }
-    if (scopeName === 'main' && hits(scope) === 0 && hits(document) > 0) { scope = document; scopeName = 'documento (el <main> no contenía mensajes)'; }
+      for (const tl of timelines) addScope(tl, activeRoot ? 'timeline de la página activa' : 'timeline de la conversación');
+    } catch (e) { /* sin línea de tiempo */ }
+    if (activeRoot) addScope(activeRoot, 'página activa de la conversación');
+    const rootScope = scopeRoot(); addScope(rootScope, rootScope === document ? 'documento' : 'main');
+    addScope(document, 'documento (el <main> no contenía mensajes)');
     const selectorCounts = {};
     const conversationId = currentConversationId();
     const fillSelectorCounts = () => { for (const s of STRATEGIES) { try { selectorCounts[s.name] = $$(s.sel, scope).length; } catch (e) { selectorCounts[s.name] = 0; } } };
-    fillSelectorCounts();
     let probes = {};
     try { probes = { article: $$('article', document).length, conTestid: $$('[data-testid]', document).length, conRol: $$('[data-message-author-role], [data-conversation-role], [data-message-role]', document).length }; } catch (e) { /* sondeo no disponible */ }
     let messages = [], chosenEls = [], duplicates = 0, unclassified = 0, skippedEmpty = 0, reconciliados = 0;
-    let cands = allCandidates(scope);
-    // El conteo crudo por selector no garantiza mensajes: una línea de tiempo puede tener
-    // aciertos y aun así no entregar ningún candidato con rol (p. ej. quedó seleccionada la
-    // conversación anterior inactiva al abrir un chat nuevo). Antes de contar, se rescata el
-    // primer ámbito que sí entregue mensajes clasificados de la conversación visible.
-    if (!cands.some((c) => c.role)) {
-      const alternatives = [];
-      const addAlt = (sc, name) => { if (sc && !alternatives.some(([x]) => x === sc)) alternatives.push([sc, name]); };
-      addAlt(activeRoot, 'página activa de la conversación');
-      const rootScope = scopeRoot(); addAlt(rootScope, rootScope === document ? 'documento' : 'main');
-      addAlt(document, 'documento (rescate: el ámbito inicial no entregó mensajes clasificados)');
-      for (const [altScope, altName] of alternatives) {
-        if (altScope === scope) continue;
-        const altCands = allCandidates(altScope);
-        if (altCands.some((c) => c.role)) { scope = altScope; scopeName = altName; cands = altCands; fillSelectorCounts(); break; }
-        if (!cands.length && altCands.length) { scope = altScope; scopeName = altName; cands = altCands; fillSelectorCounts(); }
-      }
+    // Un ámbito solo sirve si entrega al menos un mensaje con rol Y contenido real extraíble:
+    // una línea de tiempo con candidatos clasificados pero vacíos o de pura interfaz (carga,
+    // botones) no debe fijar la lectura en 0 habiendo otro ámbito con la conversación visible.
+    const candidateHasContent = (cand) => {
+      try {
+        const nodes = contentElementsFor(cand.contentEl, cand.role);
+        const text = nodes.map((node) => visibleText(node)).filter(Boolean).join('\n');
+        if (text && !/^(copy|copiar|copy code|copiar código|edit|editar|good response|bad response|share|compartir)$/i.test(text)) return true;
+        return nodes.some((node) => extractCode(node).length);
+      } catch (e) { return false; }
+    };
+    let cands = [], scopeChosen = false, classifiedFallback = null, anyFallback = null;
+    for (const opt of scopeOptions) {
+      const optCands = allCandidates(opt.scope);
+      if (!anyFallback && optCands.length) anyFallback = { opt, optCands };
+      if (!classifiedFallback && optCands.some((c) => c.role)) classifiedFallback = { opt, optCands };
+      if (optCands.some((c) => c.role && candidateHasContent(c))) { scope = opt.scope; scopeName = opt.name; cands = optCands; scopeChosen = true; break; }
     }
+    if (!scopeChosen) { // ningún ámbito entregó mensajes utilizables: se conserva la evidencia más confiable para el diagnóstico
+      const fb = classifiedFallback || anyFallback;
+      if (fb) { scope = fb.opt.scope; scopeName = fb.opt.name; cands = fb.optCands; }
+      else if (scopeOptions.length) { scope = scopeOptions[0].scope; scopeName = scopeOptions[0].name; cands = allCandidates(scope); }
+    }
+    fillSelectorCounts();
     const turnRoleTotal = new Map(), turnRoleSeen = new Map();
     for (const c of cands) { // cuántos mensajes del mismo rol comparten cada turno (para no fusionarlos)
       if (!c.role) continue;

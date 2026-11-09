@@ -478,4 +478,24 @@ assert.deepStrictEqual(d.messages.map((m) => m.text), ['Mensaje del chat nuevo v
 assert.ok(!d.messages.some((m) => m.text.includes('anterior inactivo')), 'la conversación anterior inactiva no se mezcla');
 ok('Ámbito inicial equivocado: rescate al ámbito con mensajes clasificados de la conversación visible');
 
-console.log(`\nTodas las pruebas de detección pasaron (${n}/24).`);
+// 25. Primera línea de tiempo con candidatos clasificados pero SIN contenido utilizable
+// (solo interfaz/carga): no fija la lectura en 0; se lee la línea con la conversación real
+global.location.pathname = '/c/conv-ambito-util';
+const docU = makeDoc([]);
+docU._main.appendChild(el('div', { 'data-app-action-timeline-scroll': '', role: 'region' }, '', [
+  el('div', { 'data-testid': 'conversation-turn-1', 'data-turn-id': 'turn-vacio' }, '', [
+    el('div', { 'data-message-author-role': 'assistant', 'data-message-id': 'vacio-a1' }, '', [el('button', { 'aria-label': 'Copiar' }, 'Copiar')])
+  ])
+]));
+docU._main.appendChild(el('div', { 'data-app-action-timeline-scroll': '', role: 'region' }, '', [
+  turn(1, 'user', 'u-u1', [txt('Mensaje real del chat abierto')]),
+  turn(2, 'assistant', 'u-a1', [txt('Respuesta real del chat abierto')])
+]));
+global.document = docU;
+d = A.detect();
+assert.strictEqual(d.total, 2, 'una línea de tiempo clasificada pero vacía no bloquea la lectura de la conversación real');
+assert.deepStrictEqual(d.messages.map((m) => m.text), ['Mensaje real del chat abierto', 'Respuesta real del chat abierto']);
+assert.strictEqual(d.scope, 'timeline de la conversación');
+ok('Ámbito por contenido utilizable: la línea vacía/de interfaz no fija el conteo en 0');
+
+console.log(`\nTodas las pruebas de detección pasaron (${n}/25).`);

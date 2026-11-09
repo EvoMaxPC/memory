@@ -99,9 +99,10 @@ const leaves = () => panel._all().filter((e) => !e.children.some((c) => c.tagNam
 const leafText = (frag) => { const e = leaves().find((x) => (x.textContent || '').includes(frag)); return e ? e.textContent : ''; };
 const button = (label) => panel._all().find((e) => e.tagName === 'BUTTON' && e.textContent === label);
 const activeObservers = () => FakeMO.instances.filter((o) => !o.disconnected);
-const msgObserver = () => activeObservers().find((o) => o.target !== body);
+const structureObserver = () => activeObservers().find((o) => o.target === body || o.target === html);
+const msgObserver = () => activeObservers().find((o) => o !== structureObserver());
 const fireMessages = () => { const o = msgObserver(); assert.ok(o, 'debe haber observador de mensajes activo'); o.trigger([{ target: wrapper }]); };
-const fireStructure = () => { const o = activeObservers().find((x) => x.target === body); assert.ok(o, 'debe haber observador de estructura activo'); o.trigger([{ target: body }]); };
+const fireStructure = () => { const o = structureObserver(); assert.ok(o, 'debe haber observador de estructura activo'); o.trigger([{ target: body }]); };
 
 (async () => {
   await sleep(60);
@@ -238,5 +239,19 @@ const fireStructure = () => { const o = activeObservers().find((x) => x.target =
   assert.ok(A.lastDetect().messages.every((m) => m.uid.startsWith('conv-nueva-real::')), 'los mensajes del chat nuevo quedan asociados a su ID real');
   ok('Chat nuevo: vacío en 0, primer intercambio leído y mismo conteo al recibir el ID real');
 
-  console.log(`\nTodas las pruebas del observador pasaron (${n}/9).`);
+  // 10. Sin avisos de ningún observador: se reemplaza el contenedor y cambia la URL.
+  // La verificación periódica de seguridad debe reconciliar la conversación por sí sola.
+  wrapperNuevo.remove();
+  const wrapperSeguridad = el('section');
+  wrapperSeguridad.appendChild(turn(1, 'user', 's-u1', [txt('Mensaje descubierto por seguridad')]));
+  wrapperSeguridad.appendChild(turn(2, 'assistant', 's-a1', [txt('Respuesta descubierta por seguridad')]));
+  main.appendChild(wrapperSeguridad);
+  global.location.pathname = '/c/conv-seguridad';
+  await sleep(3400); // > intervalo de seguridad (2,5 s), sin disparar observadores
+  assert.ok(leafText('Mensajes leídos: 2'), 'la verificación de seguridad descubre el chat nuevo sin avisos de observadores: ' + leafText('Mensajes leídos:'));
+  assert.strictEqual(A.lastDetect().conversationId, 'conv-seguridad');
+  assert.deepStrictEqual(A.getMessages().map((m) => m.text), ['Mensaje descubierto por seguridad', 'Respuesta descubierta por seguridad']);
+  ok('Verificación de seguridad: chat nuevo descubierto aunque ningún observador avise');
+
+  console.log(`\nTodas las pruebas del observador pasaron (${n}/10).`);
 })().catch((e) => { console.error('FALLÓ:', e); process.exit(1); });
