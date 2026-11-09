@@ -297,4 +297,45 @@ assert.strictEqual(d.messages[1].conversationId, 'conv-json');
 assert.strictEqual(d.status, 'parcial', 'la foto embebida se informa como parcial, no como lectura completa en vivo');
 ok('JSON embebido en el código de la página: orden por rama, roles, código y asociación a la conversación');
 
-console.log(`\nTodas las pruebas de detección pasaron (${n}/17).`);
+// 18. Motor único combinado: el DOM (ventana parcial) + JSON (historial) en UN registro sin duplicados
+global.location.pathname = '/c/conv-combo';
+const docC = makeDoc([]);
+docC._main.appendChild(turn(3, 'user', 'ju2', [txt('Pregunta reciente montada')]));
+docC._main.appendChild(turn(4, 'assistant', 'ja2', [txt('Respuesta reciente, versión del DOM más nueva')]));
+const payloadC = {
+  conversation_id: 'conv-combo', current_node: 'n4',
+  mapping: {
+    root: { id: 'root', parent: null, children: ['n1'], message: null },
+    n1: { id: 'n1', parent: 'root', children: ['n2'], message: { id: 'ju1', author: { role: 'user' }, status: 'finished_successfully', content: { content_type: 'text', parts: ['Pregunta antigua solo en JSON'] } } },
+    n2: { id: 'n2', parent: 'n1', children: ['n3'], message: { id: 'ja1', author: { role: 'assistant' }, status: 'finished_successfully', content: { content_type: 'text', parts: ['Respuesta antigua solo en JSON'] } } },
+    n3: { id: 'n3', parent: 'n2', children: ['n4'], message: { id: 'ju2', author: { role: 'user' }, status: 'finished_successfully', content: { content_type: 'text', parts: ['Pregunta reciente montada'] } } },
+    n4: { id: 'n4', parent: 'n3', children: [], message: { id: 'ja2', author: { role: 'assistant' }, status: 'finished_successfully', content: { content_type: 'text', parts: ['Respuesta reciente (versión JSON)'] } } }
+  }
+};
+docC._main.parentElement.appendChild(el('script', { type: 'application/json' }, JSON.stringify(payloadC)));
+global.document = docC;
+d = A.detect();
+assert.strictEqual(d.fuente, 'dom+json');
+assert.strictEqual(d.total, 4, 'un único registro combinado, sin duplicados');
+assert.deepStrictEqual([d.domTotal, d.jsonTotal, d.coincidentes, d.jsonSolo], [2, 4, 2, 2]);
+assert.strictEqual(d.messages[0].source, 'json', 'los antiguos no montados vienen del JSON, en orden');
+assert.strictEqual(d.messages[3].text, 'Respuesta reciente, versión del DOM más nueva', 'en coincidencias manda el DOM');
+assert.strictEqual(d.messages[3].source, 'dom+json');
+assert.strictEqual(new Set(d.messages.map((m) => m.uid)).size, 4, 'uids únicos en el registro combinado');
+assert.ok(d.messages.every((m) => m.conversationId === 'conv-combo'));
+ok('DOM + JSON combinados: el JSON recupera lo no montado y el DOM manda en coincidencias');
+
+// 19. JSON sin ninguna coincidencia con el DOM: no se mezcla (posible otra rama), manda el DOM
+global.location.pathname = '/c/conv-sin-match';
+const docSM = makeDoc([]);
+docSM._main.appendChild(turn(1, 'user', 'dm1', [txt('Mensaje visible sin relación con el JSON')]));
+const payloadSM = { conversation_id: 'conv-sin-match', current_node: 'x1', mapping: { x1: { id: 'x1', parent: null, children: [], message: { id: 'jx1', author: { role: 'assistant' }, status: 'finished_successfully', content: { content_type: 'text', parts: ['Texto de otra rama'] } } } } };
+docSM._main.parentElement.appendChild(el('script', { type: 'application/json' }, JSON.stringify(payloadSM)));
+global.document = docSM;
+d = A.detect();
+assert.strictEqual(d.total, 1);
+assert.strictEqual(d.fuente, 'dom');
+assert.ok(d.jsonIgnorado, 'la no coincidencia queda informada');
+ok('JSON sin coincidencias: no se mezcla con el DOM y queda informado');
+
+console.log(`\nTodas las pruebas de detección pasaron (${n}/19).`);

@@ -307,18 +307,74 @@
         if (msg.text.length >= prev.text.length) { byId.set(id, msg); elsById.set(id, cand.contentEl); }
       } else { byId.set(id, msg); elsById.set(id, cand.contentEl); }
     }
-    messages = [...byId.values()]; chosenEls = [...elsById.values()];
-    for (const [id, el] of elsById) elIdentity.set(el, id);
-    if (messages.length) prevFingerprintRegistry = fpNow;
-    let strategy = messages.length ? [...usedStrategies].join('+') : 'ninguna', fuente = 'dom';
-    if (!messages.length) { // el DOM no entregó nada: se intenta el JSON embebido en el código de la página
-      const emb = extractEmbedded(conversationId);
-      if (emb.length) {
-        fuente = 'json-embebido'; strategy = 'json-embebido-en-la-pagina';
-        messages = emb.map((m) => ({ ...m, uid: conversationId + '::' + m.id, conversationId }));
+    // ---- Motor único de lectura: DOM (principal) + JSON embebido (complemento) ----
+    // Ambas fuentes alimentan EL MISMO registro. Coincidencia entre fuentes: mismo id real, o
+    // mismo rol + texto exacto cuando ese texto es único en ambas (textos repetidos ambiguos no
+    // se fusionan por texto). En coincidencias manda el DOM (visible y actual); el JSON aporta
+    // los mensajes que el DOM no tiene montados, en el orden de su rama. Sin ninguna coincidencia
+    // entre fuentes no se mezclan (podría ser otra rama): manda el DOM y se informa.
+    const domMessages = [...byId.values()];
+    chosenEls = [...elsById.values()];
+    if (domMessages.length) prevFingerprintRegistry = fpNow;
+    const domTotal = domMessages.length;
+    const embRaw = extractEmbedded(conversationId);
+    const jsonMessages = embRaw.map((m) => ({ ...m, uid: conversationId + '::' + m.id, conversationId, source: 'json' }));
+    const jsonTotal = jsonMessages.length;
+    let strategy = domMessages.length ? [...usedStrategies].join('+') : 'ninguna', fuente = 'dom';
+    let coincidentes = 0, jsonIgnorado = false;
+    const bare = (id) => (id && id.indexOf('msg:') === 0 ? id.slice(4) : null);
+    if (!domMessages.length && jsonMessages.length) {
+      fuente = 'json-embebido'; strategy = 'json-embebido-en-la-pagina';
+      messages = jsonMessages;
+    } else if (domMessages.length && jsonMessages.length) {
+      const matchOfDom = new Map(), usedJson = new Set(); // índice DOM -> índice JSON
+      domMessages.forEach((dm, di) => { // 1) por id real
+        const b = bare(dm.id); if (!b) return;
+        const ji = jsonMessages.findIndex((jm, j) => !usedJson.has(j) && bare(jm.id) === b);
+        if (ji >= 0) { matchOfDom.set(di, ji); usedJson.add(ji); }
+      });
+      const freq = (arr) => { const f = new Map(); for (const m of arr) { const k = m.role + '\n' + m.text; f.set(k, (f.get(k) || 0) + 1); } return f; };
+      const fD = freq(domMessages), fJ = freq(jsonMessages);
+      domMessages.forEach((dm, di) => { // 2) por rol + texto exacto único en ambas fuentes
+        if (matchOfDom.has(di)) return;
+        const k = dm.role + '\n' + dm.text;
+        if (fD.get(k) !== 1 || fJ.get(k) !== 1) return;
+        const ji = jsonMessages.findIndex((jm, j) => !usedJson.has(j) && jm.role + '\n' + jm.text === k);
+        if (ji >= 0) { matchOfDom.set(di, ji); usedJson.add(ji); }
+      });
+      coincidentes = matchOfDom.size;
+      if (!coincidentes) { jsonIgnorado = true; messages = domMessages.map((m) => ({ ...m, source: 'dom' })); }
+      else {
+        fuente = 'dom+json'; strategy = [...usedStrategies].join('+') + '+json-embebido';
+        const merged = jsonMessages.map((jm, ji) => { // orden de la rama JSON como base
+          const di = [...matchOfDom].find(([, j]) => j === ji);
+          if (!di) return jm; // solo JSON: el DOM no lo tiene montado
+          const dm = domMessages[di[0]];
+          return { ...jm, id: bare(jm.id) ? jm.id : dm.id, uid: conversationId + '::' + (bare(jm.id) ? jm.id : dm.id), text: dm.text, code: dm.code.length ? dm.code : jm.code, timestamp: dm.timestamp || jm.timestamp, state: dm.state || jm.state, source: 'dom+json' };
+        });
+        const mergedIndexOfDom = new Map(); // índice DOM -> posición en merged
+        matchOfDom.forEach((ji, di) => mergedIndexOfDom.set(di, ji));
+        domMessages.forEach((dm, di) => { // solo DOM: se inserta junto a sus vecinos del DOM
+          if (matchOfDom.has(di)) return;
+          const entry = { ...dm, source: 'dom' };
+          let pos = -1;
+          for (let k = di - 1; k >= 0; k--) if (mergedIndexOfDom.has(k)) { pos = mergedIndexOfDom.get(k) + 1; break; }
+          if (pos < 0) for (let k = di + 1; k < domMessages.length; k++) if (mergedIndexOfDom.has(k)) { pos = mergedIndexOfDom.get(k); break; }
+          if (pos < 0) pos = merged.length;
+          merged.splice(pos, 0, entry);
+          for (const [dIdx, mIdx] of mergedIndexOfDom) if (mIdx >= pos) mergedIndexOfDom.set(dIdx, mIdx + 1);
+          mergedIndexOfDom.set(di, pos);
+        });
+        messages = merged;
       }
+    } else messages = domMessages.map((m) => ({ ...m, source: 'dom' }));
+    const jsonSolo = fuente === 'dom+json' ? jsonTotal - coincidentes : fuente === 'json-embebido' ? jsonTotal : 0;
+    for (const [id, el] of elsById) { // la identidad del elemento queda con el id canónico del registro único
+      const dm = domMessages.find((m) => m.id === id);
+      const reg = dm && messages.find((m) => m.text === dm.text && m.role === dm.role && (m.source === 'dom+json' || m.source === 'dom'));
+      elIdentity.set(el, reg ? reg.id : id);
     }
-    lastContainer = fuente === 'dom' ? commonContainer(chosenEls, scope) : null;
+    lastContainer = domMessages.length ? commonContainer(chosenEls, scope) : null;
     const chars = messages.reduce((a, m) => a + m.text.length, 0);
     const tokens = EVO.estimateTokens ? messages.reduce((a, m) => a + EVO.estimateTokens(m.text), 0) : Math.ceil(chars / 4);
     const reasons = [];
@@ -338,8 +394,10 @@
       if (!lastContainer) reasons.push('Se encontraron mensajes pero ningún ancestro común los contiene a todos: no se pudo fijar un contenedor de conversación observable (la estructura puede haber cambiado).');
       if (hiddenDiscarded) reasons.push(`${hiddenDiscarded} elemento(s) ocultos (línea de tiempo de navegación o conversación anterior) fueron descartados.`);
       if (fuente === 'json-embebido') reasons.push('El DOM no entregó mensajes reconocibles: estos mensajes se leyeron del JSON embebido en el código de la página (foto de la carga inicial). Pueden faltar mensajes posteriores y no hay contenedor observable hasta que el DOM los monte.');
+      if (fuente === 'dom+json') reasons.push(`Lectura combinada en un único registro: ${coincidentes} mensaje(s) coinciden en ambas fuentes (manda el DOM) y el JSON aportó ${jsonSolo} mensaje(s) que el DOM no tiene montados. El JSON es la foto de la carga inicial: puede no incluir mensajes posteriores a esa carga.`);
+      if (jsonIgnorado) reasons.push('Había JSON embebido de esta conversación pero ningún mensaje coincidió con el DOM (¿otra rama o datos desactualizados?): no se mezcló y se usó solo el DOM.');
       status = reasons.length && (streaming || messages[0].role === 'assistant') ? 'parcial' : 'dom-completo';
-      if (status === 'dom-completo' && (unclassified || skippedEmpty || !lastContainer || fuente !== 'dom')) status = 'parcial';
+      if (status === 'dom-completo' && (unclassified || skippedEmpty || !lastContainer || fuente !== 'dom' || jsonIgnorado)) status = 'parcial';
     }
     lastDetect = {
       ok: messages.length > 0, status, historialIncompleto: status === 'parcial', strategy, messages,
@@ -348,6 +406,7 @@
       assistant: messages.filter((m) => m.role === 'assistant').length,
       withCode: messages.filter((m) => m.code.length).length,
       chars, tokens, selectorCounts, duplicates, unclassified, skippedEmpty, reconciliados, ocultos: hiddenDiscarded, fuente,
+      domTotal, jsonTotal, jsonSolo, coincidentes, jsonIgnorado,
       streaming: messages.length ? stopButtons().length > 0 : false,
       containerFound: !!lastContainer, container: describeEl(lastContainer), scope: scopeName, probes,
       conversationId: (location.pathname.match(/\/c\/([\w-]+)/) || [])[1] || 'nueva',
@@ -412,6 +471,7 @@
       caracteres: d.chars, tokens_estimados: d.tokens,
       duplicados_descartados: d.duplicates, sin_rol_omitidos: d.unclassified, vacios_omitidos: d.skippedEmpty,
       reconciliados: d.reconciliados, contenedor_conversacion: d.container, cobertura: d.status, ambito_busqueda: d.scope, sondeo: d.probes, fuente: d.fuente, ocultos_descartados: d.ocultos || 0,
+      mensajes_dom: d.domTotal, mensajes_json: d.jsonTotal, solo_json: d.jsonSolo, coincidentes: d.coincidentes, json_ignorado: d.jsonIgnorado,
       cuadro_texto: c ? c.n : 'NO ENCONTRADO',
       transmitiendo: stopButtons().length > 0,
       botones_detener: stopButtons().map((b) => b.getAttribute('aria-label') || b.getAttribute('data-testid')),
