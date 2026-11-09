@@ -219,6 +219,15 @@
   // contenedor alternativo en silencio; el diagnóstico lo informa y no se observa un nodo parcial.
   function commonContainer(els, scope) {
     if (!els.length) return null;
+    if (els.length === 1) {
+      // Con un solo mensaje, el ancestro común sería el propio mensaje: observarlo dejaría
+      // fuera a la respuesta, que llega como hermana. El contenedor útil es el ámbito de
+      // lectura (línea de tiempo/main), que sí contiene a los mensajes futuros.
+      let n = els[0];
+      const limit = scope && scope.contains ? scope : null;
+      while (n.parentElement && n !== limit) n = n.parentElement;
+      return n;
+    }
     for (let n = els[0]; n; n = n.parentElement) if (els.every((e) => n.contains(e))) return n; // ancestro común más profundo
     const eff = scope && scope.contains ? scope : (document.body || document.documentElement || null); // scope=document
     return eff && els.every((e) => eff.contains(e)) ? eff : null;
@@ -534,6 +543,21 @@
     // el mismo uid, venga la repetición del DOM, del JSON o de la combinación de fuentes.
     const seenUid = new Set();
     messages = messages.filter((m) => { if (seenUid.has(m.uid)) { duplicates++; return false; } seenUid.add(m.uid); return true; });
+    // Trazabilidad normalizada de cada registro (identidad, orden, origen, estado y huella):
+    // `order` es la posición cronológica en esta lectura; `status` describe SOLO al mensaje
+    // ('streaming' si la IA lo está generando ahora; nunca declara completo el historial);
+    // `contentHash` permite verificar que el contenido registrado no cambió entre lecturas.
+    const streamingNow = stopButtons().length > 0;
+    let lastAssistantIdx = -1;
+    messages.forEach((m, i) => { if (m.role === 'assistant') lastAssistantIdx = i; });
+    const capturedAt = new Date().toISOString();
+    messages = messages.map((m, i) => ({
+      ...m,
+      order: i,
+      status: (m.state === 'en-generacion' || (streamingNow && i === lastAssistantIdx)) ? 'streaming' : 'complete',
+      contentHash: hash(m.text + '\n' + m.code.map((b) => b.code).join('\n')),
+      capturedAt
+    }));
     for (const [id, el] of elsById) { // la identidad del elemento queda con el id canónico del registro único
       const dm = domMessages.find((m) => m.id === id);
       const reg = dm && messages.find((m) => m.text === dm.text && m.role === dm.role && (m.source === 'dom+json' || m.source === 'dom'));
@@ -567,8 +591,13 @@
     const scrollEl = messages.length ? findScrollContainer() : null;
     // Integridad del historial según SOLO la lectura actual: nunca 'complete' por ver mensajes.
     // 'complete' lo declara únicamente la recuperación que alcanzó el inicio (content.js).
-    const integrity = !messages.length ? 'unverified' : status === 'parcial' ? 'partial' : 'unverified';
-    const integrityReason = !messages.length ? 'No se detectaron mensajes: no se puede comprobar el historial.'
+    // 'failed' se distingue de 'unverified': hubo elementos candidatos en el ámbito elegido
+    // pero ninguno pudo leerse como mensaje (estructura presente, lectura fallida); sin
+    // candidatos (p. ej. un chat nuevo vacío) no hay fallo que informar: queda 'unverified'.
+    const lecturaFallida = !messages.length && (cands.length > 0 || unclassified > 0 || skippedEmpty > 0);
+    const integrity = messages.length ? (status === 'parcial' ? 'partial' : 'unverified') : (lecturaFallida ? 'failed' : 'unverified');
+    const integrityReason = !messages.length
+      ? (lecturaFallida ? 'Se encontraron elementos candidatos pero ninguno pudo leerse como mensaje: la lectura falló y no se inventó contenido ni roles.' : 'No se detectaron mensajes: no se puede comprobar el historial.')
       : status === 'parcial' ? 'Se detectaron posibles faltantes en lo montado (ver motivos): el historial disponible está incompleto.'
       : 'Hay mensajes visibles, pero eso no prueba que el historial esté completo: falta verificar el inicio (recuperación de antiguos).';
     lastDetect = {
@@ -662,7 +691,7 @@
       reconciliados: d.reconciliados, contenedor_conversacion: d.container, cobertura: d.status, ambito_busqueda: d.scope, sondeo: d.probes, fuente: d.fuente, ocultos_descartados: d.ocultos || 0,
       integridad_historial: d.integrity, motivo_integridad: d.integrityReason, contenedor_desplazable: d.scrollContainer,
       mensajes_dom: d.domTotal, mensajes_json: d.jsonTotal, solo_json: d.jsonSolo, coincidentes: d.coincidentes, json_ignorado: d.jsonIgnorado,
-      mensajes_detalle: d.messages.map((m) => ({ rol: m.role, via: m.via || '', elemento: m.elemento || '', caracteres: m.text.length, inicio: m.text.slice(0, 90) })),
+      mensajes_detalle: d.messages.map((m) => ({ uid: m.uid, orden: m.order, rol: m.role, fuente: m.source || '', estado: m.status || '', hash_contenido: m.contentHash || '', via: m.via || '', elemento: m.elemento || '', caracteres: m.text.length, inicio: m.text.slice(0, 90) })),
       cuadro_texto: c ? c.n : 'NO ENCONTRADO',
       transmitiendo: stopButtons().length > 0,
       botones_detener: stopButtons().map((b) => b.getAttribute('aria-label') || b.getAttribute('data-testid')),

@@ -79,7 +79,12 @@ global.location = { pathname: '/c/conv-1' };
 global.navigator = { clipboard: { writeText: async () => {} } };
 global.prompt = () => null;
 const storageData = {};
-global.chrome = { storage: { local: { get: async () => ({}), set: async (o) => Object.assign(storageData, o) } } };
+global.chrome = { storage: { local: {
+  // La lectura devuelve una copia serializada (como el navegador real): así la prueba de
+  // recarga verifica persistencia de verdad, no referencias compartidas en memoria.
+  get: async (k) => (k && storageData[k] !== undefined ? { [k]: JSON.parse(JSON.stringify(storageData[k])) } : {}),
+  set: async (o) => Object.assign(storageData, o)
+} } };
 class FakeMO {
   static instances = [];
   constructor(cb) { this.cb = cb; this.disconnected = false; this.target = null; FakeMO.instances.push(this); }
@@ -228,8 +233,10 @@ const fireStructure = () => { const o = structureObserver(); assert.ok(o, 'debe 
   assert.ok(leafText('Mensajes leídos: 0'), 'un chat nuevo vacío cuenta 0 y no hereda la conversación anterior: ' + leafText('Mensajes leídos:'));
   assert.strictEqual(A.lastDetect().conversationId, 'nueva');
   wrapperNuevo.appendChild(turn(1, 'user', 'n-u1', [txt('Primer mensaje en el chat nuevo')]));
-  wrapperNuevo.appendChild(turn(2, 'assistant', 'n-a1', [txt('Primera respuesta en el chat nuevo')]));
   fireStructure(); await sleep(1200);
+  assert.ok(leafText('Mensajes leídos: 1'), 'el primer mensaje del usuario cuenta 1 antes de la respuesta: ' + leafText('Mensajes leídos:'));
+  wrapperNuevo.appendChild(turn(2, 'assistant', 'n-a1', [txt('Primera respuesta en el chat nuevo')]));
+  fireMessages(); await sleep(1200); // la respuesta muta dentro del contenedor ya observado: avisa el observador de mensajes
   assert.ok(leafText('Mensajes leídos: 2'), 'el primer intercambio del chat nuevo se lee en tiempo real: ' + leafText('Mensajes leídos:'));
   assert.deepStrictEqual(A.getMessages().map((m) => m.text), ['Primer mensaje en el chat nuevo', 'Primera respuesta en el chat nuevo']);
   global.location.pathname = '/c/conv-nueva-real';
@@ -253,5 +260,40 @@ const fireStructure = () => { const o = structureObserver(); assert.ok(o, 'debe 
   assert.deepStrictEqual(A.getMessages().map((m) => m.text), ['Mensaje descubierto por seguridad', 'Respuesta descubierta por seguridad']);
   ok('Verificación de seguridad: chat nuevo descubierto aunque ningún observador avise');
 
-  console.log(`\nTodas las pruebas del observador pasaron (${n}/10).`);
+  // 11. Recarga simulada de la página: DOM y módulos nuevos, mismo almacenamiento.
+  // El historial de la conversación debe recuperarse sin pérdidas ni registros duplicados.
+  button('Detener detección').click(); // cierre limpio de la «página» anterior
+  const seenSeguridad = () => { const st = storageData['evo_state_v1']; return Object.keys(st.projects[st.active].seen || {}).filter((k) => k.startsWith('conv-seguridad::')); };
+  assert.strictEqual(seenSeguridad().length, 2, 'antes de recargar hay 2 registros persistidos de la conversación');
+  const alertasAntes = storageData['evo_state_v1'].projects[storageData['evo_state_v1'].active].alerts.length;
+  const moAntes = FakeMO.instances.length;
+  const mainR = el('main'); const wrapperR = el('section'); mainR.appendChild(wrapperR);
+  wrapperR.appendChild(turn(1, 'user', 's-u1', [txt('Mensaje descubierto por seguridad')]));
+  wrapperR.appendChild(turn(2, 'assistant', 's-a1', [txt('Respuesta descubierta por seguridad')]));
+  const bodyR = el('body', {}, '', [mainR]); const htmlR = el('html', {}, '', [bodyR]);
+  global.document = {
+    body: bodyR, documentElement: htmlR, activeElement: null,
+    createElement: (t) => new El(t),
+    contains: (e) => htmlR.contains(e),
+    querySelector: (s) => (s === 'main' ? mainR : htmlR.querySelector(s)),
+    querySelectorAll: (s) => (s.trim() === 'body *' ? bodyR._all() : htmlR.querySelectorAll(s))
+  };
+  const archivos = ['core/analyzers.js', 'core/objective-engine.js', 'storage/project-storage.js', 'context/context-builder.js', 'ui/objective-panel.js', 'adapters/chatgpt.js', 'content.js'];
+  for (const f of archivos) delete require.cache[require.resolve('../' + f)];
+  delete globalThis.EVO;
+  for (const f of archivos) require('../' + f);
+  await sleep(120);
+  const A2 = globalThis.EVO.adapter;
+  host = bodyR.children.find((e) => e.getAttribute('data-evo-memory') === 'panel');
+  assert.ok(host && host.shadowRoot, 'tras la recarga el panel se reconstruye');
+  panel = host.shadowRoot.children.find((e) => e._classes.has('p')) || host.shadowRoot._all().find((e) => e._classes.has('p'));
+  assert.ok(leafText('Mensajes leídos: 2'), 'tras recargar se recuperan los 2 mensajes de la conversación: ' + leafText('Mensajes leídos:'));
+  assert.strictEqual(A2.lastDetect().total, 2);
+  assert.deepStrictEqual(A2.getMessages().map((m) => m.text), ['Mensaje descubierto por seguridad', 'Respuesta descubierta por seguridad']);
+  assert.strictEqual(seenSeguridad().length, 2, 'la recarga no duplica los registros persistidos');
+  assert.strictEqual(storageData['evo_state_v1'].projects[storageData['evo_state_v1'].active].alerts.length, alertasAntes, 'sin alertas duplicadas tras recargar');
+  assert.strictEqual(FakeMO.instances.slice(moAntes).filter((o) => !o.disconnected).length, 2, 'un solo ciclo de observación activo tras la recarga');
+  ok('Recarga: historial recuperado desde el almacenamiento, sin pérdidas ni duplicados');
+
+  console.log(`\nTodas las pruebas del observador pasaron (${n}/11).`);
 })().catch((e) => { console.error('FALLÓ:', e); process.exit(1); });

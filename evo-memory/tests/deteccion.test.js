@@ -498,4 +498,56 @@ assert.deepStrictEqual(d.messages.map((m) => m.text), ['Mensaje real del chat ab
 assert.strictEqual(d.scope, 'timeline de la conversación');
 ok('Ámbito por contenido utilizable: la línea vacía/de interfaz no fija el conteo en 0');
 
-console.log(`\nTodas las pruebas de detección pasaron (${n}/25).`);
+// 26. Diez intercambios completos: 20 mensajes, 10/10 por rol, orden y trazabilidad
+global.location.pathname = '/c/conv-diez';
+const docD = makeDoc([]);
+for (let i = 1; i <= 10; i++) {
+  docD._main.appendChild(turn(2 * i - 1, 'user', 'd-u' + i, [txt('Pregunta número ' + i)]));
+  docD._main.appendChild(turn(2 * i, 'assistant', 'd-a' + i, [txt('Respuesta número ' + i)]));
+}
+global.document = docD;
+d = A.detect();
+assert.strictEqual(d.total, 20, 'diez intercambios son exactamente 20 mensajes');
+assert.deepStrictEqual([d.user, d.assistant], [10, 10]);
+assert.strictEqual(new Set(d.messages.map((m) => m.uid)).size, 20, 'cada mensaje tiene un uid único');
+for (let i = 0; i < 20; i++) {
+  const m = d.messages[i];
+  assert.strictEqual(m.order, i, 'orden cronológico registrado');
+  assert.strictEqual(m.role, i % 2 === 0 ? 'user' : 'assistant');
+  assert.strictEqual(m.text, (i % 2 === 0 ? 'Pregunta número ' : 'Respuesta número ') + (Math.floor(i / 2) + 1));
+  assert.strictEqual(m.status, 'complete', 'sin generación en curso, el mensaje no está en streaming');
+  assert.strictEqual(m.conversationId, 'conv-diez');
+  assert.ok(m.contentHash && m.capturedAt && m.source === 'dom', 'trazabilidad: hash de contenido, captura y origen');
+}
+ok('Diez intercambios: 20 mensajes exactos (10/10), orden, identidad única y trazabilidad');
+
+// 27. Fidelidad del texto original: emojis, saltos de línea y código completos
+global.location.pathname = '/c/conv-fiel';
+const docFiel = makeDoc([]);
+const textoUsuario = 'Primera línea 😀 con emoji\nSegunda línea\n\nTercera línea tras un salto doble';
+const codigoFiel = 'const saludo = "hola 😀";\nconsole.log(saludo);';
+docFiel._main.appendChild(turn(1, 'user', 'f-u1', [txt(textoUsuario)]));
+docFiel._main.appendChild(turn(2, 'assistant', 'f-a1', [txt('Acá va el código:'), el('pre', {}, '', [el('code', { class: 'language-js' }, codigoFiel)])]));
+global.document = docFiel;
+d = A.detect();
+assert.strictEqual(d.total, 2);
+assert.strictEqual(d.messages[0].text, textoUsuario, 'el texto del usuario se conserva exacto, con emojis y saltos');
+assert.strictEqual(d.messages[1].code[0].code, codigoFiel, 'el código se conserva completo y exacto');
+assert.strictEqual(d.messages[1].code[0].lang, 'js');
+ok('Fidelidad: emojis, saltos de línea y código íntegros, sin reescritura');
+
+// 28. Integridad 'failed': hay candidatos pero ninguno legible (no es lo mismo que chat vacío)
+global.location.pathname = '/c/conv-ilegible';
+const docI = makeDoc([]);
+docI._main.appendChild(el('div', { 'data-turn-key': 'tk-y' }, 'Texto presente pero sin rol reconocible'));
+global.document = docI;
+d = A.detect();
+assert.strictEqual(d.total, 0);
+assert.strictEqual(d.status, 'fallido');
+assert.strictEqual(d.integrity, 'failed', 'candidatos sin lectura posible: fallo informado, sin inventar mensajes');
+global.document = makeDoc([]);
+d = A.detect();
+assert.strictEqual(d.integrity, 'unverified', 'sin candidatos (chat vacío): no es un fallo, queda no verificado');
+ok('Integridad failed: estructura presente pero ilegible se distingue de un chat vacío');
+
+console.log(`\nTodas las pruebas de detección pasaron (${n}/28).`);

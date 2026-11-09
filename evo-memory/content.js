@@ -121,7 +121,7 @@
     detectInfo = d; nMsgs = d.total;
     // Integridad: la lectura sola nunca declara 'complete'. Solo la sube a 'partial' si la propia
     // detección sospecha faltantes; 'complete' únicamente tras una recuperación que llegó al inicio.
-    if (!integrityByConv[cid]) integrityByConv[cid] = { state: d.integrity || 'unverified', reason: d.integrityReason || 'No se pudo comprobar si el historial está completo.' };
+    if (!integrityByConv[cid] || integrityByConv[cid].state === 'failed') integrityByConv[cid] = { state: d.integrity || 'unverified', reason: d.integrityReason || 'No se pudo comprobar si el historial está completo.' }; // un fallo anterior no tapa una lectura posterior válida
     else if (integrityByConv[cid].state === 'unverified' && d.integrity === 'partial') integrityByConv[cid] = { state: 'partial', reason: d.integrityReason };
     lastIngest.manual = !!manual;
     wasStreaming = !!(d.streaming || A.isStreaming());
