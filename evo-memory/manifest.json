@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "EVO Memory",
+  "version": "0.1.1",
+  "description": "Memoria, continuidad y control de bucles y errores para proyectos largos con ChatGPT.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "core/analyzers.js",
+        "adapters/chatgpt.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "evo-memory@local",
+      "strict_min_version": "115.0"
+    }
+  }
+}
