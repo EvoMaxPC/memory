@@ -25,6 +25,7 @@ class El {
   constructor(tag, attrs = {}, text = '') {
     this.tagName = tag.toUpperCase(); this._attrs = new Map(Object.entries(attrs)); this._text = text;
     this.children = []; this.parentElement = null; this.dataset = {}; this.style = {}; this.listeners = {};
+    this.scrollTop = 0; this.scrollHeight = 0; this.clientHeight = 0;
     this._classes = new Set();
     this.classList = { toggle: (c) => this._classes.has(c) ? this._classes.delete(c) : this._classes.add(c), add: (c) => this._classes.add(c), contains: (c) => this._classes.has(c) };
   }
@@ -195,5 +196,26 @@ const fireStructure = () => { const o = activeObservers().find((x) => x.target =
   assert.ok(recuperado && recuperado.code[0].code === 'const x = 1;' && recuperado.text.includes('código'), 'texto y código íntegros al regresar');
   ok('Regreso a una conversación: registros recuperados, separados y sin duplicar');
 
-  console.log(`\nTodas las pruebas del observador pasaron (${n}/7).`);
+  // 8. Recuperación de antiguos: desplazamiento progresivo, sin duplicados, orden, posición e integridad
+  assert.ok(leafText('Integridad del historial: unverified') || leafText('Integridad del historial: partial'), 'sin recuperación no se declara complete: ' + leafText('Integridad'));
+  main.scrollHeight = 2600; main.clientHeight = 500; main.scrollTop = 1300;
+  const totalAntes = A.getMessages().length;
+  button('Recuperar mensajes antiguos').click();
+  await sleep(250);
+  wrapper.prepend(turn(-1, 'assistant', 'c1-a0', [txt('Antiguo montado tras desplazar (2)')]));
+  await sleep(800);
+  wrapper.prepend(turn(-2, 'user', 'c1-u00', [txt('Antiguo montado tras desplazar (1, el más viejo)')]));
+  // esperar a que la recuperación alcance el inicio y declare el estado
+  let integro = false;
+  for (let i = 0; i < 24 && !integro; i++) { await sleep(500); integro = !!leafText('Integridad del historial: complete'); }
+  assert.ok(integro, 'al alcanzar el inicio sin novedades: complete. Estado: ' + leafText('Integridad'));
+  const trasRecuperar = A.getMessages();
+  assert.strictEqual(trasRecuperar.length, totalAntes + 2, 'se incorporaron solo los 2 antiguos');
+  assert.strictEqual(new Set(trasRecuperar.map((m) => m.uid)).size, trasRecuperar.length, 'sin duplicados en el registro');
+  assert.strictEqual(trasRecuperar[0].id, 'msg:c1-u00', 'orden cronológico: el más antiguo primero');
+  assert.strictEqual(trasRecuperar[1].id, 'msg:c1-a0');
+  assert.strictEqual(main.scrollTop, 1300, 'posición de lectura restaurada exactamente');
+  ok('Recuperación de antiguos sin JSON embebido: orden, sin duplicados, posición restaurada e integridad complete');
+
+  console.log(`\nTodas las pruebas del observador pasaron (${n}/8).`);
 })().catch((e) => { console.error('FALLÓ:', e); process.exit(1); });

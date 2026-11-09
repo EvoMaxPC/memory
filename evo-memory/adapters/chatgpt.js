@@ -399,8 +399,15 @@
       status = reasons.length && (streaming || messages[0].role === 'assistant') ? 'parcial' : 'dom-completo';
       if (status === 'dom-completo' && (unclassified || skippedEmpty || !lastContainer || fuente !== 'dom' || jsonIgnorado)) status = 'parcial';
     }
+    const scrollEl = messages.length ? findScrollContainer() : null;
+    // Integridad del historial según SOLO la lectura actual: nunca 'complete' por ver mensajes.
+    // 'complete' lo declara únicamente la recuperación que alcanzó el inicio (content.js).
+    const integrity = !messages.length ? 'unverified' : status === 'parcial' ? 'partial' : 'unverified';
+    const integrityReason = !messages.length ? 'No se detectaron mensajes: no se puede comprobar el historial.'
+      : status === 'parcial' ? 'Se detectaron posibles faltantes en lo montado (ver motivos): el historial disponible está incompleto.'
+      : 'Hay mensajes visibles, pero eso no prueba que el historial esté completo: falta verificar el inicio (recuperación de antiguos).';
     lastDetect = {
-      ok: messages.length > 0, status, historialIncompleto: status === 'parcial', strategy, messages,
+      ok: messages.length > 0, status, historialIncompleto: status === 'parcial', integrity, integrityReason, strategy, messages,
       total: messages.length,
       user: messages.filter((m) => m.role === 'user').length,
       assistant: messages.filter((m) => m.role === 'assistant').length,
@@ -409,12 +416,29 @@
       domTotal, jsonTotal, jsonSolo, coincidentes, jsonIgnorado,
       streaming: messages.length ? stopButtons().length > 0 : false,
       containerFound: !!lastContainer, container: describeEl(lastContainer), scope: scopeName, probes,
+      scrollContainerFound: !!scrollEl, scrollContainer: describeScroll(scrollEl),
       conversationId: (location.pathname.match(/\/c\/([\w-]+)/) || [])[1] || 'nueva',
       reasons
     };
     return lastDetect;
   }
   const getMessages = () => detect().messages;
+
+  // Contenedor realmente desplazable de la conversación: se busca desde el contenedor de mensajes
+  // hacia arriba (la línea de tiempo tiene overflow). Si no se identifica, la recuperación de
+  // antiguos NO debe desplazar nada.
+  function findScrollContainer() {
+    const chain = [];
+    for (let n = lastContainer; n; n = n.parentElement) chain.push(n);
+    for (const n of chain) {
+      let overflow = '';
+      try { overflow = (getComputedStyle(n).overflowY || '') + (getComputedStyle(n).overflowX || ''); } catch (e) { /* sin estilos computados */ }
+      if (n.scrollHeight > n.clientHeight + 24 && (/auto|scroll/.test(overflow) || attr(n, 'data-app-action-timeline-scroll') !== null)) return n;
+    }
+    for (const n of chain) if (n.scrollHeight > n.clientHeight + 24) return n; // respaldo por dimensiones
+    try { return document.querySelector('[data-app-action-timeline-scroll]'); } catch (e) { return null; }
+  }
+  const describeScroll = (el) => el ? describeEl(el) : 'no identificado';
 
   const composer = () => { for (const [n, sel] of COMPOSERS) { const el = document.querySelector(sel); if (el) return { n, el }; } return null; };
   const stopButtons = () => $$('[data-testid="stop-button"], button[aria-label]').filter((b) => {
@@ -471,6 +495,7 @@
       caracteres: d.chars, tokens_estimados: d.tokens,
       duplicados_descartados: d.duplicates, sin_rol_omitidos: d.unclassified, vacios_omitidos: d.skippedEmpty,
       reconciliados: d.reconciliados, contenedor_conversacion: d.container, cobertura: d.status, ambito_busqueda: d.scope, sondeo: d.probes, fuente: d.fuente, ocultos_descartados: d.ocultos || 0,
+      integridad_historial: d.integrity, motivo_integridad: d.integrityReason, contenedor_desplazable: d.scrollContainer,
       mensajes_dom: d.domTotal, mensajes_json: d.jsonTotal, solo_json: d.jsonSolo, coincidentes: d.coincidentes, json_ignorado: d.jsonIgnorado,
       cuadro_texto: c ? c.n : 'NO ENCONTRADO',
       transmitiendo: stopButtons().length > 0,
@@ -486,6 +511,7 @@
     strategy: () => (lastDetect ? lastDetect.strategy : 'pendiente'),
     lastDetect: () => lastDetect,
     conversationContainer: () => lastContainer,
+    scrollContainer: () => findScrollContainer(),
     getMessages, detect, insertText, diagnose
   };
 })(globalThis);

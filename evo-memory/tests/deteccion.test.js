@@ -338,4 +338,24 @@ assert.strictEqual(d.fuente, 'dom');
 assert.ok(d.jsonIgnorado, 'la no coincidencia queda informada');
 ok('JSON sin coincidencias: no se mezcla con el DOM y queda informado');
 
-console.log(`\nTodas las pruebas de detección pasaron (${n}/19).`);
+// 20. Contenedor desplazable real e integridad: sin recuperación nunca 'complete'
+global.location.pathname = '/c/conv-scroll';
+const docS = makeDoc([]);
+const tlS = el('div', { 'data-app-action-timeline-scroll': '', role: 'region' }, '', [turn(1, 'user', 's-1', [txt('Hola')]), turn(2, 'assistant', 's-2', [txt('Respuesta')])]);
+tlS.scrollTop = 900; tlS.scrollHeight = 3000; tlS.clientHeight = 600;
+docS._main.appendChild(tlS);
+global.document = docS;
+d = A.detect();
+assert.strictEqual(A.scrollContainer(), tlS, 'el contenedor desplazable es la línea de tiempo');
+assert.ok(d.scrollContainerFound);
+assert.strictEqual(d.integrity, 'unverified', 'con mensajes visibles NO se declara complete sin recuperar');
+global.document = doc4; // el que empieza en el asistente (posibles faltantes)
+global.location.pathname = '/c/conversacion-prueba';
+d = A.detect();
+assert.strictEqual(d.integrity, 'partial', 'con sospecha de faltantes: partial');
+global.document = makeDoc([]);
+d = A.detect();
+assert.strictEqual(d.integrity, 'unverified', 'sin mensajes: unverified');
+ok('Contenedor desplazable identificado e integridad parcial/no verificada sin recuperación');
+
+console.log(`\nTodas las pruebas de detección pasaron (${n}/20).`);

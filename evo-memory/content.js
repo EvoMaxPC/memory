@@ -28,6 +28,8 @@
   let detectionActive = true, msgObserver = null, structObserver = null, obsContainer = null, obsConv = '';
   let convState = 'esperando', lastUpdate = null, lastChangeAt = 0, procTimer = null, structTimer = null;
   let dupEvitados = 0, erroresLectura = 0, mutPendientes = 0, wasStreaming = false;
+  let recovering = false; const integrityByConv = {}; // integridad del historial por conversación
+  const waitMs = (ms) => new Promise((r) => setTimeout(r, ms));
   const P = () => S.projects[S.active];
   const save = () => store ? store.saveState(S) : api.storage.local.set({ [KEY]: S });
   const addAlert = (kind, msg) => { const p = P(); p.alerts.unshift({ t: Date.now(), kind, msg }); p.alerts.length = Math.min(p.alerts.length, 40); };
@@ -117,6 +119,10 @@
     lastConv = cid;
     const silent = !p.convs[cid]; // al abrir un chat antiguo se aprende del historial sin lanzar alertas
     detectInfo = d; nMsgs = d.total;
+    // Integridad: la lectura sola nunca declara 'complete'. Solo la sube a 'partial' si la propia
+    // detección sospecha faltantes; 'complete' únicamente tras una recuperación que llegó al inicio.
+    if (!integrityByConv[cid]) integrityByConv[cid] = { state: d.integrity || 'unverified', reason: d.integrityReason || 'No se pudo comprobar si el historial está completo.' };
+    else if (integrityByConv[cid].state === 'unverified' && d.integrity === 'partial') integrityByConv[cid] = { state: 'partial', reason: d.integrityReason };
     lastIngest.manual = !!manual;
     wasStreaming = !!(d.streaming || A.isStreaming());
     let dirty = ingest(d.messages, silent, wasStreaming, cid);
@@ -210,6 +216,64 @@
     clearTimeout(procTimer); clearTimeout(timer); clearTimeout(structTimer);
     render(); // los registros y contadores existentes se conservan
     say('Detección detenida: no se observan nuevos cambios. Los registros existentes se conservan.');
+  }
+  // Recuperación de mensajes antiguos: recorre el contenedor real hacia arriba de a pasos,
+  // incorpora lo que ChatGPT monte tras cada desplazamiento (mismo registro, por uid, sin
+  // duplicados y en el orden que devuelve la lectura) y restaura EXACTAMENTE el scrollTop
+  // original al terminar. Se detiene al llegar al inicio (2 comprobaciones sin novedades),
+  // tras 3 intentos sin mensajes nuevos, por cambio de conversación/contenedor o ante un error.
+  // Sin contenedor desplazable identificado no desplaza nada.
+  async function recoverHistory() {
+    if (recovering) return say('La recuperación ya está en curso.');
+    if (!detectionActive) return say('Primero iniciá la detección para recuperar mensajes antiguos.');
+    if (A.isStreaming()) return say('La IA está generando: esperá a que termine para recuperar antiguos.');
+    const cid = A.conversationId();
+    scan();
+    const cont0 = A.scrollContainer ? A.scrollContainer() : null;
+    if (!cont0) {
+      integrityByConv[cid] = { state: 'unverified', reason: 'No se identificó el contenedor desplazable de la conversación: no se ejecutó ningún desplazamiento.' };
+      render();
+      return say('No se identificó el contenedor de mensajes desplazable: no se desplazó nada.');
+    }
+    recovering = true;
+    if (refs.recBtn) { refs.recBtn.disabled = true; refs.recBtn.textContent = 'Recuperando…'; }
+    const originalTop = cont0.scrollTop;
+    const known = new Set((detectInfo ? detectInfo.messages : []).map((m) => m.uid));
+    let incorporados = 0, sinNuevos = 0, pasos = 0, motivoFin = '';
+    say('Recuperando mensajes antiguos… (no toques la conversación hasta que termine)');
+    try {
+      while (pasos < 80) {
+        pasos++;
+        if (A.conversationId() !== cid) { integrityByConv[cid] = { state: 'partial', reason: 'La recuperación se interrumpió por un cambio de conversación.' }; motivoFin = 'cambio de conversación'; break; }
+        const cont = A.scrollContainer ? A.scrollContainer() : null;
+        if (!cont || cont !== cont0 || !document.contains(cont0)) { integrityByConv[cid] = { state: 'partial', reason: 'El contenedor de la conversación fue reemplazado durante la recuperación.' }; motivoFin = 'contenedor reemplazado'; break; }
+        const antes = cont.scrollTop, paso = Math.max(240, Math.floor((cont.clientHeight || 600) * 0.85));
+        cont.scrollTop = Math.max(0, cont.scrollTop - paso);
+        await waitMs(650); // tiempo para que ChatGPT monte los antiguos; el observador y este escaneo los incorporan
+        scan();
+        const ahora = A.lastDetect ? A.lastDetect() : detectInfo;
+        const nuevos = (ahora ? ahora.messages : []).filter((m) => !known.has(m.uid));
+        nuevos.forEach((m) => known.add(m.uid));
+        incorporados += nuevos.length;
+        sinNuevos = nuevos.length ? 0 : sinNuevos + 1;
+        if (cont.scrollTop <= 0) {
+          if (sinNuevos >= 2) { integrityByConv[cid] = { state: 'complete', reason: `Se alcanzó el inicio del historial (parte superior del contenedor) y no aparecieron mensajes nuevos en 2 comprobaciones seguidas. Antiguos incorporados en esta recuperación: ${incorporados}.` }; motivoFin = 'inicio alcanzado'; break; }
+        } else if (sinNuevos >= 3) { integrityByConv[cid] = { state: 'partial', reason: `Sin mensajes nuevos después de 3 intentos sin llegar al inicio. Antiguos incorporados: ${incorporados}.` }; motivoFin = 'sin mensajes nuevos'; break; }
+        if (cont.scrollTop === antes && cont.scrollTop > 0) { integrityByConv[cid] = { state: 'partial', reason: 'El contenedor no se desplazó (no respondió al desplazamiento).' }; motivoFin = 'sin desplazamiento'; break; }
+        render();
+      }
+      if (!motivoFin) integrityByConv[cid] = { state: 'partial', reason: `Recuperación detenida por el límite de ${pasos} pasos. Antiguos incorporados: ${incorporados}.` };
+    } catch (e) {
+      erroresLectura++;
+      integrityByConv[cid] = { state: incorporados ? 'partial' : 'unverified', reason: 'Error durante la recuperación: ' + ((e && e.message) || String(e)) };
+      motivoFin = 'error';
+    } finally {
+      try { const cont = (A.scrollContainer && A.scrollContainer()) || cont0; if (cont && document.contains(cont)) cont.scrollTop = originalTop; } catch (e) { /* restaurar es best-effort si el DOM cambió */ }
+      recovering = false;
+      if (refs.recBtn) { refs.recBtn.disabled = false; refs.recBtn.textContent = 'Recuperar mensajes antiguos'; }
+      render();
+    }
+    say(`Recuperación terminada (${motivoFin}): ${incorporados} antiguos incorporados · integridad: ${integrityByConv[cid].state}. Posición de lectura restaurada.`);
   }
   const manualDetect = () => startDetection(true);
 
@@ -343,6 +407,7 @@
       status: h('div', { className: 'm' }), live: h('div', { className: 'm' }), meter: h('div', { className: 'm' }), bar: h('div', { className: 'bar' }, h('i')),
       detect: h('div', { className: 'm det', textContent: 'Detección: todavía no ejecutada. Pulsá «Iniciar detección».' }),
       detState: h('div', { className: 'm' }),
+      recBtn: h('button', { textContent: 'Recuperar mensajes antiguos', onclick: () => recoverHistory() }),
       alerts: h('div'), diag: h('pre', { className: 'd' }), dec: h('ul'), rul: h('ul'), fail: h('ul'),
       proj: h('select', { onchange: () => { S.active = refs.proj.value; pendingChange = null; save(); fill(); render(); } }),
       next: h('textarea', { rows: 2, placeholder: 'Qué sigue, en una frase', onchange: () => { P().nextStep = refs.next.value; save(); } })
@@ -351,7 +416,9 @@
       h('div', { className: 'row' }, h('b', { textContent: 'EVO Memory ' + VERSION }), refs.proj, h('button', { textContent: 'Nuevo', onclick: newProj })),
       refs.bar, refs.meter, refs.live, refs.status,
       h('div', { className: 'row' }, h('button', { textContent: 'Iniciar detección', onclick: () => startDetection(true) }), h('button', { textContent: 'Detener detección', onclick: stopDetection })),
-      refs.detState, refs.detect,
+      refs.detState,
+      h('div', { className: 'row' }, refs.recBtn, h('span', { className: 'm', textContent: 'Recorre hacia arriba, incorpora antiguos y restaura tu posición' })),
+      refs.detect,
       EVO.ObjectivePanel ? EVO.ObjectivePanel.build(h, refs, panelActions) : h('div', { className: 'm', textContent: '⚠ Módulo de datos protegidos no cargado.' }),
       h('h4', { textContent: 'Alertas' }), refs.alerts,
       h('h4', { textContent: 'Decisiones confirmadas' }), refs.dec, adder('Decisión (se copia tal cual)', (v) => P().decisions.push(v)),
@@ -379,8 +446,10 @@
       : '○ Detección detenida · los registros existentes se conservan';
     if (refs.detect && detectInfo) {
       const d = detectInfo, estado = d.status === 'fallido' ? '❌ DETECCIÓN FALLIDA' : d.status === 'parcial' ? '⚠ ANÁLISIS PARCIAL (solo lo cargado en el DOM)' : '✓ Cobertura: DOM disponible completo (no garantiza mensajes fuera del DOM)';
+      const integ = integrityByConv[d.conversationId] || { state: d.integrity || 'unverified', reason: d.integrityReason || 'No se pudo comprobar si el historial está completo.' };
       refs.detect.textContent = [
         `${estado} · conversación: ${d.conversationId}`,
+        `Integridad del historial: ${integ.state} — ${integ.reason}`,
         `Contenedor de conversación: ${d.containerFound ? d.container : 'no encontrado'} · fuente: ${d.fuente === 'dom+json' ? `DOM + JSON combinados en un único registro (DOM ${d.domTotal} · JSON ${d.jsonTotal} · coinciden ${d.coincidentes} · solo JSON ${d.jsonSolo})` : d.fuente === 'json-embebido' ? 'JSON embebido en el código de la página (foto inicial)' : 'DOM visible'} · ámbito de búsqueda: ${d.scope || 'main'} · observadores: ${detectionActive ? `estructura ${structObserver ? 'activo' : 'inactivo'} · mensajes ${msgObserver ? 'activo (' + (d.container || '') + ')' : 'sin contenedor'}` : 'detenidos'}`,
         `Total únicos: ${d.total} · usuario: ${d.user} · IA: ${d.assistant} · con código: ${d.withCode}`,
         `Caracteres: ${d.chars.toLocaleString()} · tokens estimados: ${d.tokens.toLocaleString()}`,
