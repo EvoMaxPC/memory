@@ -36,9 +36,17 @@
     { name: 'agent-turn', sel: '[data-chatgpt-agent-turn-start]', kind: 'turn' },
     { name: 'assistant-markdown', sel: '[data-markdown-text-style="assistant-message"]', kind: 'direct' },
     { name: 'assistant-markdown-2', sel: '[data-assistant-markdown]', kind: 'direct' },
-    { name: 'transcript', sel: 'li[data-message-role]', kind: 'transcript' }
+    { name: 'assistant-markdown-root', sel: '[data-assistant-markdown-root]', kind: 'direct' },
+    { name: 'user-message-tone', sel: '[data-markdown-text-tone="user-message"]', kind: 'direct' },
+    { name: 'transcript', sel: 'li[data-message-role]', kind: 'transcript' },
+    { name: 'markdown-copy', sel: '[data-markdown-copy="contents"]', kind: 'direct' }
   ];
-  const INNER_MESSAGE_SEL = '[data-message-author-role], [data-conversation-role], [data-message-role], [data-user-message-bubble], [data-markdown-text-style="assistant-message"], [data-assistant-markdown], [data-content-search-unit-key], [data-chatgpt-search-unit-key]';
+  const INNER_MESSAGE_SEL = '[data-message-author-role], [data-conversation-role], [data-message-role], [data-user-message-bubble], [data-markdown-text-style="assistant-message"], [data-assistant-markdown], [data-assistant-markdown-root], [data-markdown-text-tone="user-message"], [data-markdown-copy="contents"], [data-content-search-unit-key], [data-chatgpt-search-unit-key]';
+  // Nodo que contiene SOLO lo que la persona escribió o SOLO la respuesta de la IA. Los
+  // contenedores (turno/unidad) sirven para identidad y orden, pero el texto se lee de acá:
+  // usuario -> burbuja; asistente -> contenido markdown copiable de la respuesta.
+  const USER_CONTENT_SELS = ['[data-user-message-bubble]', '[data-markdown-text-tone="user-message"]'];
+  const ASSISTANT_CONTENT_SELS = ['[data-markdown-copy="contents"]', '[data-markdown-text-style="assistant-message"]', '[data-assistant-markdown-root]', '[data-assistant-markdown]', '[data-message-author-role="assistant"]', '[data-conversation-role="assistant"]', '[data-message-role="assistant"]'];
   const ID_ATTRS = ['data-message-id', 'data-turn-key', 'data-content-search-unit-key', 'data-turn-id'];
   const COMPOSERS = [
     ['prompt-textarea', '#prompt-textarea'],
@@ -74,26 +82,104 @@
   const roleOf = (el) => validRole(attr(el, 'data-message-author-role') || attr(el, 'data-conversation-role') || attr(el, 'data-message-role') || attr(el, 'data-turn'))
     || unitKeyRole(el)
     || (attr(el, 'data-user-message-bubble') !== null ? 'user' : null)
+    || (attr(el, 'data-markdown-text-tone') === 'user-message' ? 'user' : null)
+    || (attr(el, 'data-markdown-copy') === 'contents' ? 'assistant' : null)
     || (attr(el, 'data-markdown-text-style') === 'assistant-message' ? 'assistant' : null)
-    || (attr(el, 'data-assistant-markdown') !== null ? 'assistant' : null)
+    || (attr(el, 'data-assistant-markdown') !== null || attr(el, 'data-assistant-markdown-root') !== null ? 'assistant' : null)
     || (attr(el, 'data-chatgpt-agent-turn-start') !== null ? 'assistant' : null);
+  const currentConversationId = () => (location.pathname.match(/\/c\/([\w-]+)/) || [])[1] || 'nueva';
+  // Rótulos de atribución («You said:» / «ChatGPT said:») que ChatGPT pone junto al mensaje:
+  // son interfaz, jamás el contenido ni un mensaje aparte.
+  const isAttributionLabel = (el) => !!el && /^H[1-6]$/.test(el.tagName || '')
+    && (attr(el, 'data-message-attribution') !== null || attr(el, 'data-conversation-role') !== null
+      || /^(you said|chatgpt said|dijiste|chatgpt dijo):?$/i.test((el.textContent || '').trim()));
 
-  // Texto del mensaje desde el elemento correcto: SIEMPRE sobre un clon sin interfaz.
-  // Se eliminan botones, menús, controles, iconos y rótulos para lectores de pantalla
-  // («ChatGPT said:» / «You said:», clase sr-only): eso es interfaz, no contenido del mensaje.
-  // Nunca se elimina la raíz aunque sea un button[data-user-message-bubble]: ahí vive el texto
-  // del usuario; solo se limpian sus controles internos.
+  function codeBlockValue(block) {
+    const inner = block.querySelector ? (block.querySelector('[data-language]') || block.querySelector('code') || block.querySelector('pre') || block) : block;
+    const target = inner && inner.tagName === 'PRE' && inner.querySelector ? (inner.querySelector('code') || inner) : inner;
+    const lineEls = target && target.children ? [...target.children].filter((c) => c.tagName === 'DIV') : [];
+    const code = lineEls.length && lineEls.every((c) => c.tagName === 'DIV')
+      ? lineEls.map((c) => c.textContent || '').join('\n')
+      : ((target && (target.innerText || target.textContent)) || '').replace(/\n+$/, '');
+    const langEl = block.querySelector ? (block.querySelector('[data-language]') || block.querySelector('code') || block) : block;
+    const cls = (langEl && langEl.className) || block.className || '';
+    const lang = attr(langEl, 'data-language') || (String(cls).match(/language-([\w+#-]+)/) || [])[1] || '';
+    return { lang, code };
+  }
+  function extractCode(contentEl) {
+    const out = [], seen = new Set();
+    const add = (b) => { if (b && b.code.trim() && !seen.has(b.code)) { seen.add(b.code); out.push(b); } };
+    for (const pre of $$('pre', contentEl)) add(codeBlockValue(pre));
+    for (const block of $$('[data-code-block]', contentEl)) {
+      if (block.querySelector && block.querySelector('pre')) continue; // ya contado como <pre>
+      add(codeBlockValue(block));
+    }
+    return out;
+  }
+  // Texto reconstruido desde los nodos del contenido (no desde el contenedor): conserva
+  // párrafos, listas y líneas de código sin depender del innerText de un clon desconectado.
+  function renderedText(root) {
+    if (!root) return '';
+    if (root.isConnected && typeof root.innerText === 'string') return root.innerText;
+    const BLOCK = new Set(['ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'DD', 'DETAILS', 'DIV', 'DL', 'DT', 'FIELDSET', 'FIGCAPTION', 'FIGURE', 'FOOTER', 'FORM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HEADER', 'HR', 'LI', 'MAIN', 'NAV', 'OL', 'P', 'SECTION', 'SUMMARY', 'TABLE', 'TBODY', 'TFOOT', 'THEAD', 'TR', 'UL']);
+    const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'SVG', 'TEXTAREA', 'INPUT', 'SELECT', 'BUTTON', 'ANNOTATION']);
+    const walk = (node, isRoot) => {
+      if (!node) return '';
+      if (node.nodeType === 3) return node.nodeValue || '';
+      if (node.nodeType && node.nodeType !== 1) return '';
+      const tag = node.tagName || '';
+      if (tag === 'PRE' || attr(node, 'data-code-block') !== null) return '\n' + codeBlockValue(node).code + '\n';
+      // La raíz sí puede ser la burbuja del usuario aunque sea un <button>: ahí vive su texto.
+      if ((SKIP.has(tag) && !(isRoot && attr(node, 'data-user-message-bubble') !== null)) || attr(node, 'data-markdown-copy') === 'exclude' || attr(node, 'aria-hidden') === 'true') return '';
+      if (String(node.className || '').split(/\s+/).includes('sr-only')) return '';
+      if (tag === 'BR') return '\n';
+      const kids = node.childNodes ? [...node.childNodes] : (node.children ? [...node.children] : []);
+      if (!kids.length) return node._text || node.textContent || '';
+      const inner = kids.map((k) => walk(k, false)).join('');
+      if (tag === 'TD' || tag === 'TH') return (node.previousElementSibling ? ' | ' : '') + inner.trim();
+      if (tag === 'LI' && !isRoot) {
+        const list = node.parentElement, items = list && list.children ? [...list.children].filter((c) => c.tagName === 'LI') : [];
+        const prefix = list && list.tagName === 'OL' ? `${Math.max(1, items.indexOf(node) + 1)}. ` : '- ';
+        return '\n' + prefix + inner.trim() + '\n';
+      }
+      if (BLOCK.has(tag) && !isRoot) return '\n' + inner + '\n';
+      return inner;
+    };
+    return walk(root, true).replace(/\r\n?/g, '\n').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n');
+  }
+  // Texto del mensaje desde su nodo de contenido: SIEMPRE sobre un clon sin interfaz.
+  // Se eliminan botones, menús, controles, iconos, partes marcadas como no copiables y los
+  // rótulos «You said:» / «ChatGPT said:»: eso es interfaz, no lo que la persona escribió ni
+  // la respuesta de la IA. Nunca se elimina la raíz aunque sea un button[data-user-message-bubble].
   function visibleText(el) {
     try {
       const clone = el.cloneNode(true);
-      // Se conserva únicamente el elemento burbuja si aparece como control en la lista; sus
-      // botones internos (editar, etc.) sí se eliminan.
       const isUserBubble = (n) => attr(n, 'data-user-message-bubble') !== null;
-      [...clone.querySelectorAll('button, [role="button"], nav, textarea, select, input, svg, script, style, [aria-hidden="true"]')]
+      [...clone.querySelectorAll('button, [role="button"], nav, textarea, select, input, svg, script, style, [aria-hidden="true"], [data-markdown-copy="exclude"], h4[data-message-attribution], h4[data-conversation-role]')]
         .filter((n) => !isUserBubble(n)).forEach((n) => n.remove());
       $$('*', clone).filter((n) => String(n.className || '').split(/\s+/).includes('sr-only')).forEach((n) => n.remove());
-      return (clone.innerText || clone.textContent || '').replace(/^\s+/, '').replace(/\s+$/, '');
-    } catch (e) { return (el.innerText || el.textContent || '').replace(/^\s+/, '').replace(/\s+$/, ''); }
+      $$('h1, h2, h3, h4, h5, h6', clone).filter((n) => /^(you said|chatgpt said|dijiste|chatgpt dijo):?$/i.test((n.textContent || '').trim())).forEach((n) => n.remove());
+      return renderedText(clone).replace(/^\s+/, '').replace(/\s+$/, '');
+    } catch (e) { return renderedText(el).replace(/^\s+/, '').replace(/\s+$/, ''); }
+  }
+  // Devuelve el/los nodos de contenido exacto dentro del candidato. Si el candidato es una
+  // unidad/turno, NO se lee el contenedor entero: se busca la burbuja del usuario o el
+  // contenido markdown de la IA. Solo sin ese nodo se usa el candidato (variantes anteriores).
+  function contentElementsFor(el, role) {
+    if (!el || !role) return [el];
+    const sels = role === 'user' ? USER_CONTENT_SELS : ASSISTANT_CONTENT_SELS;
+    for (const sel of sels) {
+      let found = [];
+      try { found = outer($$(sel, el)).filter((n) => !inEvo(n) && !isAttributionLabel(n)); } catch (e) { /* selector no disponible */ }
+      try { if (el.matches && el.matches(sel) && !isAttributionLabel(el)) found = [el, ...found.filter((n) => n !== el)]; } catch (e) { /* sin matches */ }
+      found = outer(found);
+      if (found.length) {
+        const codeNodes = [...$$('pre', el), ...$$('[data-code-block]', el)];
+        if (codeNodes.some((c) => !found.some((n) => n === c || n.contains(c) || c.contains(n)))) return [el]; // código fuera del nodo: se conserva el conjunto en orden
+        return found;
+      }
+    }
+    return [el];
   }
   // Navegación / barras laterales / encabezados nunca son mensajes de la conversación.
   const inNavigation = (el) => {
@@ -104,14 +190,6 @@
     }
     return false;
   };
-  function extractCode(contentEl) {
-    return $$('pre', contentEl).map((pre) => {
-      const c = pre.querySelector ? pre.querySelector('code') : null;
-      const cls = (c && c.className) || pre.className || '';
-      const lang = (String(cls).match(/language-([\w+#-]+)/) || [])[1] || '';
-      return { lang, code: (c ? (c.innerText || c.textContent || '') : (pre.innerText || pre.textContent || '')).replace(/\n+$/, '') };
-    }).filter((b) => b.code.trim().length);
-  }
   function stableId(contentEl, turnEl, role, text, pos, ctx) {
     // 0) La interfaz actual lista el/los ids reales del mensaje en data-chatgpt-search-message-ids.
     const mids = attr(contentEl, 'data-chatgpt-search-message-ids') || attr(turnEl, 'data-chatgpt-search-message-ids');
@@ -156,7 +234,7 @@
           out.push({ contentEl: li, turnEl: li, role: roleOf(li), isTurn: false, strategy: strategy.name });
       return out;
     }
-    const els = outer($$(strategy.sel, scope)).filter((e) => !inEvo(e));
+    const els = outer($$(strategy.sel, scope)).filter((e) => !inEvo(e) && !isAttributionLabel(e));
     if (strategy.kind === 'direct') {
       for (const el of els) out.push({ contentEl: el, turnEl: turnOf(el) || el, role: roleOf(el), isTurn: false, strategy: strategy.name });
       return out;
@@ -164,7 +242,7 @@
     // Contenedores de turno/unidad: si adentro hay mensajes individuales, se leen ESOS (el turno no
     // se cuenta como mensaje); si no hay, el contenedor solo se usa si su rol es semántico y claro.
     for (const turn of els) {
-      const inside = outer($$(INNER_MESSAGE_SEL, turn)).filter((e) => !inEvo(e));
+      const inside = outer($$(INNER_MESSAGE_SEL, turn)).filter((e) => !inEvo(e) && !isAttributionLabel(e));
       if (inside.length) {
         // El rol sale del propio elemento. Solo si el turno contiene UN único elemento y el turno
         // trae rol semántico explícito, ese rol lo clasifica (no es una aproximación entre varios).
@@ -190,6 +268,31 @@
     try { if (typeof el.checkVisibility === 'function' && !el.checkVisibility()) return false; } catch (e) { /* se conserva */ }
     return true;
   }
+  const inInactivePage = (el) => {
+    for (let n = el; n; n = n.parentElement) {
+      const v = attr(n, 'data-app-shell-active-page');
+      if (v === 'false') return true;
+      if (v === 'true') return false;
+    }
+    return false;
+  };
+  const nearestTurnKey = (el) => { for (let n = el; n; n = n.parentElement) if (attr(n, 'data-turn-key')) return n; return null; };
+  function belongsToOtherConversation(cand, conversationId) {
+    if (!conversationId || conversationId === 'nueva') return false;
+    const root = cand.turnEl || cand.contentEl;
+    const ids = [];
+    const own = attr(root, 'data-chatgpt-selection-conversation-id');
+    if (own) ids.push(own);
+    try {
+      for (const tagged of $$('[data-chatgpt-selection-conversation-id]', root)) {
+        const turn = nearestTurnKey(tagged);
+        if (turn && root && attr(root, 'data-turn-key') && turn !== root) continue; // marca de un turno anidado ajeno
+        const id = attr(tagged, 'data-chatgpt-selection-conversation-id');
+        if (id) ids.push(id);
+      }
+    } catch (e) { /* sin marcas de conversación */ }
+    return ids.length > 0 && !ids.includes(conversationId);
+  }
   function allCandidates(scope) {
     hiddenDiscarded = 0;
     const byEl = new Map();
@@ -202,6 +305,9 @@
       && (c.contentEl.contains(o.contentEl) || o.contentEl.contains(c.contentEl))));
     ordered = ordered.filter((c) => { const v = isVisible(c.contentEl); if (!v) hiddenDiscarded++; return v; });
     ordered = ordered.filter((c) => { const nav = inNavigation(c.contentEl); if (nav) hiddenDiscarded++; return !nav; }); // navegación/barras: no son mensajes
+    ordered = ordered.filter((c) => { const inactive = inInactivePage(c.contentEl); if (inactive) hiddenDiscarded++; return !inactive; }); // conversación anterior inactiva
+    const cidNow = currentConversationId();
+    ordered = ordered.filter((c) => { const other = belongsToOtherConversation(c, cidNow); if (other) hiddenDiscarded++; return !other; }); // marcas de otra conversación
     try {
       const order = new Map([scope, ...$$('*', scope)].map((e, i) => [e, i]));
       ordered.sort((a, b) => (order.get(a.contentEl) ?? 1e9) - (order.get(b.contentEl) ?? 1e9));
@@ -281,17 +387,22 @@
     // fuera del primer <main>). Quedarse solo con un <main> vacío fue un fallo real reportado:
     // mensajes visibles en la página y todos los contadores en 0.
     let scope = scopeRoot(), scopeName = scope === document ? 'documento' : 'main';
+    // Al cambiar de chat dentro de la app, ChatGPT puede conservar la conversación anterior
+    // en una página inactiva del DOM. Si hay página activa marcada, SOLO se lee esa.
+    let activeRoot = null;
+    try { activeRoot = outer($$('[data-app-shell-active-page="true"]', document)).filter((e) => !inEvo(e))[0] || null; } catch (e) { /* sin marca de página activa */ }
+    if (activeRoot) { scope = activeRoot; scopeName = 'página activa de la conversación'; }
     const hits = (sc) => { try { return STRATEGIES.reduce((a, s) => a + $$(s.sel, sc).length, 0); } catch (e) { return 0; } };
     // Ámbito preferido en la interfaz actual: la línea de tiempo desplazable de la conversación.
     // Acota la lectura a la conversación visible y deja fuera la línea oculta de navegación.
     try {
-      const timelines = $$('[data-app-action-timeline-scroll][role="region"], [data-app-action-timeline-scroll]', document);
+      const timelines = $$('[data-app-action-timeline-scroll][role="region"], [data-app-action-timeline-scroll]', activeRoot || document);
       const tl = timelines.find((t) => hits(t) > 0);
-      if (tl) { scope = tl; scopeName = 'timeline de la conversación'; }
+      if (tl) { scope = tl; scopeName = activeRoot ? 'timeline de la página activa' : 'timeline de la conversación'; }
     } catch (e) { /* sin línea de tiempo: se sigue con main/documento */ }
     if (scopeName === 'main' && hits(scope) === 0 && hits(document) > 0) { scope = document; scopeName = 'documento (el <main> no contenía mensajes)'; }
     const selectorCounts = {};
-    const conversationId = (location.pathname.match(/\/c\/([\w-]+)/) || [])[1] || 'nueva';
+    const conversationId = currentConversationId();
     for (const s of STRATEGIES) { try { selectorCounts[s.name] = $$(s.sel, scope).length; } catch (e) { selectorCounts[s.name] = 0; } }
     let probes = {};
     try { probes = { article: $$('article', document).length, conTestid: $$('[data-testid]', document).length, conRol: $$('[data-message-author-role], [data-conversation-role], [data-message-role]', document).length }; } catch (e) { /* sondeo no disponible */ }
@@ -307,7 +418,9 @@
     const byId = new Map(), elsById = new Map(), roleCount = { user: 0, assistant: 0 }, fpNow = [], usedStrategies = new Set();
     for (const cand of cands) {
       if (!cand.role) { unclassified++; continue; }
-      const text = visibleText(cand.contentEl, cand.isTurn), code = extractCode(cand.contentEl);
+      const contentNodes = contentElementsFor(cand.contentEl, cand.role);
+      const text = contentNodes.map((node) => visibleText(node)).filter(Boolean).join('\n\n');
+      const code = contentNodes.flatMap((node) => extractCode(node));
       if ((!text && !code.length) || /^(copy|copiar|copy code|copiar código|edit|editar|good response|bad response|share|compartir)$/i.test(text)) { skippedEmpty++; continue; } // carga, vacío o solo interfaz sin contenido real
       const tKey = cand.turnEl;
       if (!turnRoleSeen.has(tKey)) turnRoleSeen.set(tKey, { user: 0, assistant: 0 });
@@ -318,7 +431,7 @@
       const timeEl = cand.contentEl.querySelector ? cand.contentEl.querySelector('time') : null;
       // Cada mensaje queda asociado a SU conversación y con un uid único entre conversaciones:
       // el mismo id local (turno/huella) en otro chat nunca se confunde con este.
-      const msg = { id, uid: conversationId + '::' + id, conversationId, role: cand.role, text, code, timestamp: attr(timeEl, 'datetime') || null, via: cand.strategy, elemento: describeEl(cand.contentEl) };
+      const msg = { id, uid: conversationId + '::' + id, conversationId, role: cand.role, text, code, timestamp: attr(timeEl, 'datetime') || null, via: cand.strategy, elemento: describeEl(contentNodes[0] || cand.contentEl) };
       if (id.startsWith('fp:')) fpNow.push({ id, role: cand.role, ph: hash(text.slice(0, 160)), rolePos: ctx.rolePos });
       if (byId.has(id)) { // mismo mensaje repetido o actualizado: conserva el contenido más completo
         duplicates++;

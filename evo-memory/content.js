@@ -184,7 +184,7 @@
           obsConv = cid; obsContainer = null;
           if (msgObserver) { msgObserver.disconnect(); msgObserver = null; }
           lastSig = ''; convState = 'esperando';
-          say(`Conversación cambiada (${cid}): se separan los mensajes de esta conversación; los registros anteriores se conservan.`);
+          say('Conversación cambiada: se leen solo los mensajes de esta conversación; los anteriores se conservan.');
           scan();
         } else if (!contOk) { obsContainer = null; scan(); } // contenedor reconstruido o mensajes recién cargados
         else if (A.isStreaming() !== wasStreaming) schedule(); // apareció/desapareció la señal de generación (p. ej. botón detener fuera del contenedor): reevaluar y, si terminó, analizar la versión final
@@ -200,13 +200,13 @@
     try {
       const d = runDetect(!!manual); // escaneo inmediato y completo de lo disponible en el DOM
       applyDetect(d, !!manual);
-      say(d.status === 'fallido' ? 'Detección iniciada, pero no se encontraron mensajes. Revisá el detalle bajo los botones.'
-        : `Detección activa: ${d.total} mensajes únicos (${lastIngest.nuevos} nuevos, ${lastIngest.actualizados} actualizados).`);
+      say(d.status === 'fallido' ? 'Lectura activa: todavía no hay mensajes legibles en esta conversación.'
+        : `Lectura activa: ${d.total} mensajes únicos (${lastIngest.nuevos} nuevos, ${lastIngest.actualizados} actualizados).`);
     } catch (e) {
       erroresLectura++;
       detectInfo = { status: 'fallido', strategy: 'ninguna', total: 0, user: 0, assistant: 0, withCode: 0, chars: 0, tokens: 0, selectorCounts: {}, duplicates: 0, skippedEmpty: 0, unclassified: 0, reconciliados: 0, containerFound: false, container: 'no encontrado', streaming: false, conversationId: A.conversationId(), reasons: ['Error al analizar el DOM: ' + ((e && e.message) || String(e))] };
       nMsgs = 0; render();
-      say('Detección fallida: ' + ((e && e.message) || String(e)));
+      say('No se pudo iniciar la lectura de mensajes en esta página.');
     }
   }
   function stopDetection() {
@@ -215,7 +215,7 @@
     if (structObserver) { structObserver.disconnect(); structObserver = null; }
     clearTimeout(procTimer); clearTimeout(timer); clearTimeout(structTimer);
     render(); // los registros y contadores existentes se conservan
-    say('Detección detenida: no se observan nuevos cambios. Los registros existentes se conservan.');
+    say('Lectura detenida: no se observan nuevos cambios. Los mensajes ya leídos se conservan.');
   }
   // Recuperación de mensajes antiguos: recorre el contenedor real hacia arriba de a pasos,
   // incorpora lo que ChatGPT monte tras cada desplazamiento (mismo registro, por uid, sin
@@ -233,7 +233,7 @@
     if (!cont0) {
       integrityByConv[cid] = { state: 'unverified', reason: 'No se identificó el contenedor desplazable de la conversación: no se ejecutó ningún desplazamiento.' };
       render();
-      return say('No se identificó el contenedor de mensajes desplazable: no se desplazó nada.');
+      return say('No se movió la conversación: desde esta vista no se pudieron recuperar mensajes antiguos.');
     }
     recovering = true;
     if (refs.recBtn) { refs.recBtn.disabled = true; refs.recBtn.textContent = 'Recuperando…'; }
@@ -273,7 +273,10 @@
       if (refs.recBtn) { refs.recBtn.disabled = false; refs.recBtn.textContent = 'Recuperar mensajes antiguos'; }
       render();
     }
-    say(`Recuperación terminada (${motivoFin}): ${incorporados} antiguos incorporados · integridad: ${integrityByConv[cid].state}. Posición de lectura restaurada.`);
+    const historialCompleto = integrityByConv[cid] && integrityByConv[cid].state === 'complete';
+    say(historialCompleto
+      ? `Recuperación terminada: ${incorporados} mensajes antiguos incorporados. Se llegó al comienzo de la conversación y tu posición fue restaurada.`
+      : `Recuperación terminada: ${incorporados} mensajes antiguos incorporados. Tu posición fue restaurada.`);
   }
   const manualDetect = () => startDetection(true);
 
@@ -314,13 +317,11 @@
     .bar i{display:block;height:100%;border-radius:3px;background:var(--ac)}
     .bar.w i{background:var(--wn)}.bar.b i{background:#d1344a}
     .a{padding:6px 8px;margin:4px 0;border-left:3px solid var(--wn);background:rgba(154,91,0,.08);border-radius:0 6px 6px 0}
-    .d{white-space:pre-wrap;font:11px/1.3 monospace;margin:8px 0 0;color:var(--mu)}
-    .det{white-space:pre-wrap;word-break:break-word;border:1px solid var(--bd);border-radius:6px;padding:6px}
     .acts{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}` + (EVO.ObjectivePanel ? EVO.ObjectivePanel.STYLES : '');
 
   const refs = {};
   const say = (m) => { refs.status.textContent = m; setTimeout(() => { if (refs.status.textContent === m) refs.status.textContent = ''; }, 4000); };
-  const insert = (t) => say(A.insertText(t) ? 'Texto insertado. Revisalo y enviá vos.' : 'No encontré el cuadro de texto: revisá el selector del adaptador.');
+  const insert = (t) => say(A.insertText(t) ? 'Texto insertado. Revisalo y enviá vos.' : 'No encontré el cuadro para escribir el texto.');
 
   // ---------- Cambios protegidos: revisión → confirmación → guardado con historial ----------
   function showPending() {
@@ -381,9 +382,10 @@
     save(); render();
   }
   function showDiag() {
+    // El diagnóstico es información técnica de soporte: se copia solo si el usuario lo pide.
+    // Nunca se vuelca como texto dentro del panel.
     const d = JSON.stringify(A.diagnose(), null, 1);
-    refs.diag.textContent = d;
-    navigator.clipboard.writeText(d).then(() => say('Diagnóstico copiado al portapapeles.'), () => say('Diagnóstico a la vista (no se pudo copiar).'));
+    navigator.clipboard.writeText(d).then(() => say('Datos técnicos copiados al portapapeles.'), () => say('No se pudieron copiar los datos técnicos.'));
   }
   async function newProj() {
     const name = prompt('Nombre del proyecto');
@@ -405,10 +407,9 @@
     };
     Object.assign(refs, {
       status: h('div', { className: 'm' }), live: h('div', { className: 'm' }), meter: h('div', { className: 'm' }), bar: h('div', { className: 'bar' }, h('i')),
-      detect: h('div', { className: 'm det', textContent: 'Detección: todavía no ejecutada. Pulsá «Iniciar detección».' }),
       detState: h('div', { className: 'm' }),
       recBtn: h('button', { textContent: 'Recuperar mensajes antiguos', onclick: () => recoverHistory() }),
-      alerts: h('div'), diag: h('pre', { className: 'd' }), dec: h('ul'), rul: h('ul'), fail: h('ul'),
+      alerts: h('div'), dec: h('ul'), rul: h('ul'), fail: h('ul'),
       proj: h('select', { onchange: () => { S.active = refs.proj.value; pendingChange = null; save(); fill(); render(); } }),
       next: h('textarea', { rows: 2, placeholder: 'Qué sigue, en una frase', onchange: () => { P().nextStep = refs.next.value; save(); } })
     });
@@ -418,7 +419,6 @@
       h('div', { className: 'row' }, h('button', { textContent: 'Iniciar detección', onclick: () => startDetection(true) }), h('button', { textContent: 'Detener detección', onclick: stopDetection })),
       refs.detState,
       h('div', { className: 'row' }, refs.recBtn, h('span', { className: 'm', textContent: 'Recorre hacia arriba, incorpora antiguos y restaura tu posición' })),
-      refs.detect,
       EVO.ObjectivePanel ? EVO.ObjectivePanel.build(h, refs, panelActions) : h('div', { className: 'm', textContent: '⚠ Módulo de datos protegidos no cargado.' }),
       h('h4', { textContent: 'Alertas' }), refs.alerts,
       h('h4', { textContent: 'Decisiones confirmadas' }), refs.dec, adder('Decisión (se copia tal cual)', (v) => P().decisions.push(v)),
@@ -431,8 +431,7 @@
         h('button', { textContent: 'Marcar último código como fallido', onclick: markFailed }),
         h('button', { textContent: 'Copiar traspaso', onclick: () => navigator.clipboard.writeText(contextText() + '\n\n' + CONTRACT).then(() => say('Traspaso copiado.')) }),
         h('button', { textContent: 'Borrar alertas', onclick: () => { P().alerts = []; save(); render(); } }),
-        h('button', { textContent: 'Diagnóstico', onclick: showDiag })),
-      refs.diag);
+        h('button', { textContent: 'Copiar datos técnicos', onclick: showDiag })));
     root.append(h('style', { textContent: CSS }), h('button', { className: 't', textContent: 'EVO', onclick: () => panel.classList.toggle('open') }), panel);
     document.body.append(host);
   }
@@ -440,26 +439,15 @@
   function render() {
     const p = P(), pct = Math.min(100, Math.round((ctx / LIMIT) * 100));
     refs.proj.replaceChildren(...Object.entries(S.projects).map(([id, v]) => h('option', { value: id, textContent: v.name, selected: id === S.active })));
-    refs.live.textContent = `Detectados: ${nMsgs} mensajes` + (detectInfo ? ` (${detectInfo.user} de usuario · ${detectInfo.assistant} de IA · estrategia: ${detectInfo.strategy})` : ` (estrategia: ${A.strategy()})`) + ` · escaneos: ${scans}` + (lastError ? ` · ERROR: ${lastError}` : '');
+    // Vista normal del usuario: solo cantidades y estado simple. El detalle técnico
+    // (selectores, contenedor, motivos, errores e integridad) queda dentro de
+    // A.diagnose() y se copia únicamente con «Copiar datos técnicos»; no se muestra acá.
+    refs.live.textContent = detectInfo
+      ? `Mensajes leídos: ${nMsgs} (${detectInfo.user} tuyos · ${detectInfo.assistant} de la IA)`
+      : `Mensajes leídos: ${nMsgs}`;
     if (refs.detState) refs.detState.textContent = detectionActive
-      ? `● Detección activa · estado de la conversación: ${convState}${convState === 'procesando' ? ' (la respuesta se está generando; el mismo registro se actualiza)' : convState === 'actualizada' ? ' (sin cambios recientes y sin señal de generación: indicio, no prueba de fin)' : ' (sin mensajes nuevos)'} · última actualización: ${lastUpdate ? lastUpdate.toLocaleTimeString() : '—'}`
-      : '○ Detección detenida · los registros existentes se conservan';
-    if (refs.detect && detectInfo) {
-      const d = detectInfo, estado = d.status === 'fallido' ? '❌ DETECCIÓN FALLIDA' : d.status === 'parcial' ? '⚠ ANÁLISIS PARCIAL (solo lo cargado en el DOM)' : '✓ Cobertura: DOM disponible completo (no garantiza mensajes fuera del DOM)';
-      const integ = integrityByConv[d.conversationId] || { state: d.integrity || 'unverified', reason: d.integrityReason || 'No se pudo comprobar si el historial está completo.' };
-      refs.detect.textContent = [
-        `${estado} · conversación: ${d.conversationId}`,
-        `Integridad del historial: ${integ.state} — ${integ.reason}`,
-        `Contenedor de conversación: ${d.containerFound ? d.container : 'no encontrado'} · fuente: ${d.fuente === 'dom+json' ? `DOM + JSON combinados en un único registro (DOM ${d.domTotal} · JSON ${d.jsonTotal} · coinciden ${d.coincidentes} · solo JSON ${d.jsonSolo})` : d.fuente === 'json-embebido' ? 'JSON embebido en el código de la página (foto inicial)' : 'DOM visible'} · ámbito de búsqueda: ${d.scope || 'main'} · observadores: ${detectionActive ? `estructura ${structObserver ? 'activo' : 'inactivo'} · mensajes ${msgObserver ? 'activo (' + (d.container || '') + ')' : 'sin contenedor'}` : 'detenidos'}`,
-        `Total únicos: ${d.total} · usuario: ${d.user} · IA: ${d.assistant} · con código: ${d.withCode}`,
-        `Caracteres: ${d.chars.toLocaleString()} · tokens estimados: ${d.tokens.toLocaleString()}`,
-        `Estrategia: ${d.strategy} · por selector: ${Object.entries(d.selectorCounts || {}).map(([k, v]) => `${k}=${v}`).join(', ')}`,
-        `Nuevos: ${lastIngest.nuevos} · antiguos incorporados: ${lastIngest.antiguos || 0} · actualizados: ${lastIngest.actualizados} · duplicados evitados (sesión): ${dupEvitados} · en este escaneo: ${d.duplicates} · reconciliados: ${d.reconciliados || 0}${lastIngest.manual ? ' · (escaneo manual)' : ''}`,
-        `Descartados: vacíos/carga ${d.skippedEmpty} · sin rol ${d.unclassified} · errores de lectura: ${erroresLectura}${lastError ? ' · último error: ' + lastError : ''}`,
-        ...(d.reasons || []).map((r) => '• ' + r),
-        'La lectura cubre solo los mensajes presentes en el DOM; si ChatGPT no cargó el historial completo, el análisis es parcial. Ningún mensaje detectado se convierte solo en decisión confirmada ni toca los datos protegidos.'
-      ].join('\n');
-    }
+      ? `● Lectura activa · ${convState === 'procesando' ? 'la IA está respondiendo' : convState === 'actualizada' ? 'conversación actualizada' : 'esperando mensajes'}${lastUpdate ? ' · ' + lastUpdate.toLocaleTimeString() : ''}`
+      : '○ Lectura detenida · los mensajes ya leídos se conservan';
     refs.bar.className = 'bar' + (pct >= 90 ? ' b' : pct >= 70 ? ' w' : '');
     refs.bar.firstChild.style.width = pct + '%';
     refs.meter.textContent = `Contexto de esta conversación: ~${ctx.toLocaleString()} tokens (estimación)` + (pct >= 70 ? '. Conviene traspasar a un chat nuevo.' : '');

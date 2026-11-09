@@ -110,16 +110,18 @@ const fireStructure = () => { const o = activeObservers().find((x) => x.target =
   panel = host.shadowRoot.children.find((e) => e._classes.has('p')) || host.shadowRoot._all().find((e) => e._classes.has('p'));
 
   // 1. Inicio: escaneo inmediato, contadores y dos observadores (estructura + mensajes)
-  assert.ok(leafText('Detección activa'), 'indicador de detección activa');
-  assert.ok(leafText('Detectados: 2 mensajes'), 'contador inicial correcto: ' + leafText('Detectados:'));
+  assert.ok(leafText('Lectura activa'), 'indicador de lectura activa');
+  assert.ok(leafText('Mensajes leídos: 2'), 'contador inicial correcto: ' + leafText('Mensajes leídos:'));
+  const textoPanel = panel._all().map((e) => e.textContent || '').join('\n');
+  assert.ok(!textoPanel.includes('por selector:') && !textoPanel.includes('Integridad del historial:') && !textoPanel.includes('DETECCIÓN FALLIDA') && !textoPanel.includes('contenedor_conversacion'), 'la vista normal no expone el diagnóstico técnico de falla');
   assert.strictEqual(activeObservers().length, 2, 'un observador de estructura y uno de mensajes');
   assert.ok(msgObserver().target.contains(wrapper.children[0]), 'el contenedor observado contiene los mensajes');
-  ok('Inicio: escaneo inmediato, contadores y doble observación sin acumulación');
+  ok('Inicio: escaneo inmediato, contadores simples y doble observación sin acumulación');
 
   // 2. Mensaje nuevo como hermano en el mismo contenedor
   wrapper.appendChild(turn(3, 'user', 'c1-u2', [txt('Pregunta nueva')]));
   fireMessages(); await sleep(500);
-  assert.ok(leafText('Detectados: 3 mensajes'), 'el mensaje nuevo se incorpora: ' + leafText('Detectados:'));
+  assert.ok(leafText('Mensajes leídos: 3'), 'el mensaje nuevo se incorpora: ' + leafText('Mensajes leídos:'));
   ok('Mensaje nuevo agregado al mismo contenedor detectado en tiempo real');
 
   // 3. Streaming: mismo registro, cambio con igual longitud, código que aparece, sin análisis final anticipado
@@ -128,13 +130,13 @@ const fireStructure = () => { const o = activeObservers().find((x) => x.target =
   const stopBtn = el('button', { 'data-testid': 'stop-button' }, '');
   main.appendChild(stopBtn);
   fireMessages(); await sleep(500);
-  assert.ok(leafText('Detectados: 4 mensajes'));
-  assert.ok(leafText('procesando'), 'estado procesando durante la generación');
+  assert.ok(leafText('Mensajes leídos: 4'));
+  assert.ok(leafText('la IA está respondiendo'), 'estado simple durante la generación');
   assert.ok(leafText('Sin alertas.'), 'la respuesta incompleta todavía no se analiza como final');
   a2txt._text = 'Parte dos!'; // misma longitud, contenido distinto
   fireMessages(); await sleep(500);
-  assert.ok(leafText('Detectados: 4 mensajes'), 'sin duplicar al cambiar el texto');
-  assert.ok(leafText('actualizados: 1'), 'cambio con igual longitud detectado por firma completa: ' + leafText('actualizados'));
+  assert.ok(leafText('Mensajes leídos: 4'), 'sin duplicar al cambiar el texto');
+  assert.strictEqual(A.getMessages().find((m) => m.id === 'msg:c1-a2').text, 'Parte dos!', 'cambio con igual longitud detectado en el mismo mensaje');
   const a2 = wrapper.children[3].children[0];
   a2.appendChild(el('pre', {}, '', [el('code', { class: 'language-js' }, 'const x = 1;')]));
   a2txt._text = 'Parte dos! Ahora con código:';
@@ -145,7 +147,7 @@ const fireStructure = () => { const o = activeObservers().find((x) => x.target =
   // 4. Fin de generación (desaparece la señal): se analiza la versión final una sola vez
   stopBtn.remove();
   fireStructure(); await sleep(1200);
-  assert.ok(leafText('Detectados: 4 mensajes'));
+  assert.ok(leafText('Mensajes leídos: 4'));
   assert.ok(!leafText('Sin alertas.') || panel._all().some((e) => (e.textContent || '').includes('contrato')), 'la versión final se analiza (alerta de contrato presente)');
   const alertsOnce = panel._all().filter((e) => (e.textContent || '').includes('no trae el bloque [EVO]')).length;
   fireMessages(); await sleep(500);
@@ -160,25 +162,25 @@ const fireStructure = () => { const o = activeObservers().find((x) => x.target =
   wrapper2.appendChild(turn(1, 'user', 'c2-u1', [txt('Otra conversación')]));
   wrapper2.appendChild(turn(2, 'assistant', 'c2-a1', [txt('Respuesta de la otra')]));
   fireStructure(); await sleep(1200);
-  assert.ok(leafText('Detectados: 2 mensajes'), 'la nueva conversación se cuenta por separado: ' + leafText('Detectados:'));
-  assert.ok(leafText('conv-2'), 'el diagnóstico identifica la conversación nueva');
+  assert.ok(leafText('Mensajes leídos: 2'), 'la nueva conversación se cuenta por separado: ' + leafText('Mensajes leídos:'));
+  assert.strictEqual(A.lastDetect().conversationId, 'conv-2', 'el registro interno queda asociado a la conversación nueva sin exponerlo como diagnóstico');
   assert.strictEqual(activeObservers().length, 2, 'sigue habiendo un solo ciclo de observación');
   ok('Cambio de conversación sin mezclar y con observadores reiniciados');
 
   // 6. Detener: se desconecta todo y no se procesa nada nuevo; reiniciar recupera sin acumular
   button('Detener detección').click();
   assert.strictEqual(activeObservers().length, 0, 'al detener no queda ningún observador activo');
-  assert.ok(leafText('Detección detenida'));
+  assert.ok(leafText('Lectura detenida'));
   wrapper2.appendChild(turn(3, 'user', 'c2-u2', [txt('Mientras estaba detenido')]));
   await sleep(300);
-  assert.ok(leafText('Detectados: 2 mensajes'), 'detenido no procesa cambios y conserva registros');
+  assert.ok(leafText('Mensajes leídos: 2'), 'detenido no procesa cambios y conserva registros');
   button('Iniciar detección').click();
   await sleep(100);
-  assert.ok(leafText('Detectados: 3 mensajes'), 'al reiniciar incorpora lo que apareció mientras estaba detenido');
+  assert.ok(leafText('Mensajes leídos: 3'), 'al reiniciar incorpora lo que apareció mientras estaba detenido');
   assert.strictEqual(activeObservers().length, 2, 'reinicio sin acumular observadores');
   button('Iniciar detección').click();
   await sleep(100);
-  assert.ok(leafText('Detectados: 3 mensajes'), 'reescaneo manual sin duplicados');
+  assert.ok(leafText('Mensajes leídos: 3'), 'reescaneo manual sin duplicados');
   assert.strictEqual(activeObservers().length, 2, 'inicios repetidos no acumulan observadores');
   ok('Detener conserva y desconecta; reiniciar recupera con un único ciclo activo');
 
@@ -188,16 +190,15 @@ const fireStructure = () => { const o = activeObservers().find((x) => x.target =
   wrapper.prepend(turn(0, 'user', 'c1-u0', [txt('Antiguo cargado al volver')]));
   main.appendChild(wrapper);
   fireStructure(); await sleep(1200);
-  assert.ok(leafText('Detectados: 5 mensajes'), 'al volver se recupera la conversación original completa: ' + leafText('Detectados:'));
-  assert.ok(leafText('conv-1'));
-  assert.ok(leafText('antiguos incorporados: 1'), 'el antiguo prependido se clasifica como antiguo, no nuevo: ' + leafText('antiguos'));
-  assert.ok(leafText('Nuevos: 0'), 'lo ya registrado en esta conversación no se reprocesa');
+  assert.ok(leafText('Mensajes leídos: 5'), 'al volver se recupera la conversación original completa: ' + leafText('Mensajes leídos:'));
+  assert.strictEqual(A.lastDetect().conversationId, 'conv-1', 'el registro vuelve a asociarse a la primera conversación');
+  assert.strictEqual(A.getMessages()[0].id, 'msg:c1-u0', 'el antiguo cargado al volver queda incorporado al principio sin mezclar');
   const recuperado = A.getMessages().find((m) => m.id === 'msg:c1-a2');
   assert.ok(recuperado && recuperado.code[0].code === 'const x = 1;' && recuperado.text.includes('código'), 'texto y código íntegros al regresar');
   ok('Regreso a una conversación: registros recuperados, separados y sin duplicar');
 
-  // 8. Recuperación de antiguos: desplazamiento progresivo, sin duplicados, orden, posición e integridad
-  assert.ok(leafText('Integridad del historial: unverified') || leafText('Integridad del historial: partial'), 'sin recuperación no se declara complete: ' + leafText('Integridad'));
+  // 8. Recuperación de antiguos: desplazamiento progresivo, sin duplicados, orden y posición
+  assert.notStrictEqual(A.lastDetect().integrity, 'complete', 'sin recuperación la lectura sola no declara el historial completo');
   main.scrollHeight = 2600; main.clientHeight = 500; main.scrollTop = 1300;
   const totalAntes = A.getMessages().length;
   button('Recuperar mensajes antiguos').click();
@@ -205,17 +206,17 @@ const fireStructure = () => { const o = activeObservers().find((x) => x.target =
   wrapper.prepend(turn(-1, 'assistant', 'c1-a0', [txt('Antiguo montado tras desplazar (2)')]));
   await sleep(800);
   wrapper.prepend(turn(-2, 'user', 'c1-u00', [txt('Antiguo montado tras desplazar (1, el más viejo)')]));
-  // esperar a que la recuperación alcance el inicio y declare el estado
+  // esperar a que la recuperación alcance el inicio y lo informe con lenguaje simple
   let integro = false;
-  for (let i = 0; i < 24 && !integro; i++) { await sleep(500); integro = !!leafText('Integridad del historial: complete'); }
-  assert.ok(integro, 'al alcanzar el inicio sin novedades: complete. Estado: ' + leafText('Integridad'));
+  for (let i = 0; i < 24 && !integro; i++) { await sleep(500); integro = !!leafText('Se llegó al comienzo de la conversación'); }
+  assert.ok(integro, 'al alcanzar el inicio sin novedades se informa sin exponer el estado técnico');
   const trasRecuperar = A.getMessages();
   assert.strictEqual(trasRecuperar.length, totalAntes + 2, 'se incorporaron solo los 2 antiguos');
   assert.strictEqual(new Set(trasRecuperar.map((m) => m.uid)).size, trasRecuperar.length, 'sin duplicados en el registro');
   assert.strictEqual(trasRecuperar[0].id, 'msg:c1-u00', 'orden cronológico: el más antiguo primero');
   assert.strictEqual(trasRecuperar[1].id, 'msg:c1-a0');
   assert.strictEqual(main.scrollTop, 1300, 'posición de lectura restaurada exactamente');
-  ok('Recuperación de antiguos sin JSON embebido: orden, sin duplicados, posición restaurada e integridad complete');
+  ok('Recuperación de antiguos sin JSON embebido: orden, sin duplicados, posición restaurada e inicio alcanzado');
 
   console.log(`\nTodas las pruebas del observador pasaron (${n}/8).`);
 })().catch((e) => { console.error('FALLÓ:', e); process.exit(1); });

@@ -19,7 +19,7 @@ Al abrir un chat antiguo, aprende del historial sin lanzar alertas; solo avisa d
 
 ## 2. Verificar la captura (sin consola)
 
-Abrí un chat con mensajes, pulsá **EVO → Diagnóstico**. Muestra (y copia al portapapeles) qué encontró:
+Abrí un chat con mensajes y mirá el conteo simple del panel: «Mensajes leídos» con cuántos son tuyos y cuántos de la IA. El diagnóstico técnico no se muestra en la interfaz. Solo si hace falta soporte, pulsá **EVO → Copiar datos técnicos** para copiarlo al portapapeles sin imprimirlo en el panel:
 `estrategia_mensajes` (debe ser distinta de NINGUNA), `mensajes`, `cuadro_texto` y `transmitiendo` (debe ser `false` si la IA no está respondiendo).
 Con esos datos se ajusta `adapters/chatgpt.js`, el único archivo que depende del sitio.
 

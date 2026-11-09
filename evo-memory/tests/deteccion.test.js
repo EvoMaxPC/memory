@@ -397,4 +397,46 @@ const detalle = A.diagnose().mensajes_detalle;
 assert.strictEqual(detalle.length, 3, 'el detalle del diagnóstico coincide con los 3 mensajes');
 ok('Conversación U/IA/U: exactamente 3 reales con roles y contenidos correctos, sin duplicados ni interfaz');
 
-console.log(`\nTodas las pruebas de detección pasaron (${n}/21).`);
+// 22. Forma exacta de leer: solo burbuja del usuario y contenido real de la IA, en la página activa
+global.location.pathname = '/c/conv-exacta';
+const docX = makeDoc([]);
+docX._main.appendChild(el('div', { 'data-app-shell-active-page': 'false' }, '', [
+  el('button', { 'data-user-message-bubble': 'true' }, 'Pregunta de la conversación anterior inactiva')
+]));
+const tlX = el('div', { 'data-app-action-timeline-scroll': '', role: 'region' }, '', [
+  el('div', { 'data-turn-key': 'exact-1' }, '', [
+    el('div', { 'data-content-search-unit-key': 'exact-turn-0:0:user', 'data-chatgpt-search-message-ids': 'exact-u1' }, '', [
+      el('h4', { 'data-message-attribution': '' }, 'You said:'),
+      el('button', { 'data-user-message-bubble': 'true' }, '', [el('span', {}, 'Necesito revisar mi PC\nsin perder mis archivos'), el('button', {}, 'Editar')])
+    ]),
+    el('div', { 'data-content-search-unit-key': 'exact-turn-0:1:assistant', 'data-chatgpt-search-message-ids': 'exact-a1' }, '', [
+      el('h4', { 'data-message-attribution': '' }, 'ChatGPT said:'),
+      el('div', { 'data-markdown-copy': 'contents' }, '', [
+        el('p', {}, 'Claro: primero hacé una copia.'),
+        el('div', { 'data-code-block': '' }, '', [
+          el('div', { 'data-markdown-copy': 'exclude' }, 'JavaScript'),
+          el('div', { 'data-language': 'js' }, '', [el('div', {}, 'const copia = true;'), el('div', {}, 'console.log(copia);')])
+        ]),
+        el('p', {}, 'Después revisamos la memoria.')
+      ]),
+      el('button', {}, 'Copiar'),
+      el('div', { 'data-markdown-copy': 'exclude' }, 'Texto de interfaz que no debe leerse')
+    ])
+  ]),
+  el('div', { 'data-turn-key': 'exact-ajeno', 'data-chatgpt-selection-conversation-id': 'conv-otra' }, '', [
+    el('button', { 'data-user-message-bubble': 'true' }, 'Mensaje marcado de otra conversación')
+  ])
+]);
+docX._main.appendChild(el('div', { 'data-app-shell-active-page': 'true' }, '', [tlX]));
+global.document = docX;
+d = A.detect();
+assert.strictEqual(d.total, 2, 'solo los dos mensajes reales de la conversación activa: ' + JSON.stringify(d.messages.map((m) => m.text)));
+assert.deepStrictEqual(d.messages.map((m) => m.role), ['user', 'assistant']);
+assert.strictEqual(d.messages[0].text, 'Necesito revisar mi PC\nsin perder mis archivos', 'solo lo que la persona escribió en la burbuja');
+assert.ok(d.messages[1].text.includes('Claro: primero hacé una copia.') && d.messages[1].text.includes('Después revisamos la memoria.'), 'respuesta exacta desde el nodo de contenido');
+assert.strictEqual(d.messages[1].code[0].lang, 'js');
+assert.strictEqual(d.messages[1].code[0].code, 'const copia = true;\nconsole.log(copia);', 'código por líneas, sin encabezado de interfaz');
+assert.ok(!d.messages.some((m) => /ChatGPT said|You said|Copiar|Texto de interfaz|otra conversación|inactiva/.test(m.text)), 'sin rótulos, controles ni mensajes ajenos');
+ok('Lectura exacta: burbuja de usuario + contenido de IA, página activa y conversación actual');
+
+console.log(`\nTodas las pruebas de detección pasaron (${n}/22).`);
