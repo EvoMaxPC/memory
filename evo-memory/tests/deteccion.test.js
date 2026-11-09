@@ -550,4 +550,54 @@ d = A.detect();
 assert.strictEqual(d.integrity, 'unverified', 'sin candidatos (chat vacío): no es un fallo, queda no verificado');
 ok('Integridad failed: estructura presente pero ilegible se distingue de un chat vacío');
 
-console.log(`\nTodas las pruebas de detección pasaron (${n}/28).`);
+// 29. Ruta provisional /c/WEB:{uuid}: identidad completa, sin truncar a «WEB», y única por chat
+const docW = makeDoc([]);
+docW._main.appendChild(turn(1, 'user', 'w-u1', [txt('Mensaje en chat provisional')]));
+docW._main.appendChild(turn(2, 'assistant', 'w-a1', [txt('Respuesta en chat provisional')]));
+global.document = docW;
+global.location.pathname = '/c/WEB:11111111-2222-3333-4444-555555555555';
+assert.strictEqual(A.conversationId(), 'WEB:11111111-2222-3333-4444-555555555555', 'la identidad provisional es el WEB:{uuid} completo, jamás «WEB» a secas');
+assert.strictEqual(A.identityKind(A.conversationId()), 'provisional');
+d = A.detect();
+assert.strictEqual(d.total, 2);
+assert.ok(d.messages.every((m) => m.conversationId === 'WEB:11111111-2222-3333-4444-555555555555' && m.uid.startsWith('WEB:11111111-2222-3333-4444-555555555555::')), 'los mensajes quedan bajo la identidad provisional completa');
+global.location.pathname = '/c/WEB:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+assert.strictEqual(A.conversationId(), 'WEB:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+d = A.detect();
+assert.ok(d.messages.every((m) => m.uid.startsWith('WEB:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee::')), 'dos conversaciones WEB distintas no comparten identidad');
+ok('Ruta /c/WEB:{uuid}: identidad provisional completa y distinta por conversación');
+
+// 30. Rutas /uc/{id}: reconocidas, con identidad propia por conversación
+global.location.pathname = '/uc/uuid-uc-uno';
+assert.strictEqual(A.conversationId(), 'uuid-uc-uno');
+assert.strictEqual(A.identityKind(A.conversationId()), 'definitiva');
+d = A.detect();
+assert.ok(d.messages.every((m) => m.conversationId === 'uuid-uc-uno' && m.uid.startsWith('uuid-uc-uno::')));
+global.location.pathname = '/uc/uuid-uc-dos';
+assert.strictEqual(A.conversationId(), 'uuid-uc-dos');
+d = A.detect();
+assert.ok(d.messages.every((m) => m.uid.startsWith('uuid-uc-dos::')), 'dos conversaciones UC distintas no comparten identidad');
+ok('Rutas /uc/{id}: reconocidas y separadas por conversación');
+
+// 31. Sin ID en la ruta: cada episodio de chat nuevo tiene su identidad temporal propia
+global.location.pathname = '/';
+const temporal1 = A.conversationId();
+assert.strictEqual(A.identityKind(temporal1), 'temporal');
+global.location.pathname = '/c/identidad-intermedia';
+assert.strictEqual(A.conversationId(), 'identidad-intermedia', 'al aparecer el ID de ruta, la temporal se descarta');
+global.location.pathname = '/';
+const temporal2 = A.conversationId();
+assert.strictEqual(A.identityKind(temporal2), 'temporal');
+assert.notStrictEqual(temporal2, temporal1, 'un segundo chat nuevo sin ID no reutiliza la identidad temporal del anterior');
+ok('Identidad temporal propia por episodio de chat nuevo, sin reutilizar la anterior');
+
+// 32. Transición /uc/{uuid} → /c/{uuid}: mismo identificador, misma identidad y mismos uid
+global.location.pathname = '/uc/mismo-uuid-123';
+const dUc = A.detect();
+global.location.pathname = '/c/mismo-uuid-123';
+assert.strictEqual(A.conversationId(), 'mismo-uuid-123', 'el identificador no cambia entre /uc/ y /c/');
+const dC = A.detect();
+assert.deepStrictEqual(dC.messages.map((m) => m.uid), dUc.messages.map((m) => m.uid), 'sin migración ni duplicación: los uid ya eran los definitivos');
+ok('Transición /uc/{uuid} → /c/{uuid}: identidad y uid estables');
+
+console.log(`\nTodas las pruebas de detección pasaron (${n}/32).`);

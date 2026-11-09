@@ -44,7 +44,7 @@ class El {
   append(...kids) { for (const k of kids) { if (k == null || k === false) continue; this.appendChild(typeof k === 'string' ? new El('#text', {}, k) : k); } }
   prepend(c) { c.parentElement = this; this.children.unshift(c); return c; }
   replaceChildren(...kids) { this.children = []; this.append(...kids); }
-  remove() { if (this.parentElement) { const i = this.parentElement.children.indexOf(this); if (i >= 0) this.parentElement.children.splice(i, 1); } }
+  remove() { if (this.parentElement) { const i = this.parentElement.children.indexOf(this); if (i >= 0) this.parentElement.children.splice(i, 1); this.parentElement = null; } } // como en el navegador: el nodo sale del documento
   contains(o) { for (let n = o; n; n = n.parentElement) if (n === this) return true; return false; }
   closest(sel) { for (let n = this; n; n = n.parentElement) if (n.tagName !== '#TEXT' && matches(n, sel)) return n; return null; }
   matches(sel) { return matches(this, sel); }
@@ -76,6 +76,14 @@ global.document = {
   querySelectorAll: (s) => (s.trim() === 'body *' ? body._all() : html.querySelectorAll(s))
 };
 global.location = { pathname: '/c/conv-1' };
+// history y popstate simulados: el fake de pushState/replaceState actualiza la ruta,
+// como hace el navegador; los listeners de popstate quedan registrados para dispararlos.
+const routeListeners = {};
+global.addEventListener = (t, fn) => { (routeListeners[t] = routeListeners[t] || []).push(fn); };
+global.history = {
+  pushState: (st, t, url) => { if (url != null) global.location.pathname = String(url); },
+  replaceState: (st, t, url) => { if (url != null) global.location.pathname = String(url); }
+};
 global.navigator = { clipboard: { writeText: async () => {} } };
 global.prompt = () => null;
 const storageData = {};
@@ -104,7 +112,7 @@ const leaves = () => panel._all().filter((e) => !e.children.some((c) => c.tagNam
 const leafText = (frag) => { const e = leaves().find((x) => (x.textContent || '').includes(frag)); return e ? e.textContent : ''; };
 const button = (label) => panel._all().find((e) => e.tagName === 'BUTTON' && e.textContent === label);
 const activeObservers = () => FakeMO.instances.filter((o) => !o.disconnected);
-const structureObserver = () => activeObservers().find((o) => o.target === body || o.target === html);
+const structureObserver = () => activeObservers().find((o) => o.target && o.target.tagName === 'HTML'); // raíz del documento (también tras la recarga simulada)
 const msgObserver = () => activeObservers().find((o) => o !== structureObserver());
 const fireMessages = () => { const o = msgObserver(); assert.ok(o, 'debe haber observador de mensajes activo'); o.trigger([{ target: wrapper }]); };
 const fireStructure = () => { const o = structureObserver(); assert.ok(o, 'debe haber observador de estructura activo'); o.trigger([{ target: body }]); };
@@ -295,5 +303,69 @@ const fireStructure = () => { const o = structureObserver(); assert.ok(o, 'debe 
   assert.strictEqual(FakeMO.instances.slice(moAntes).filter((o) => !o.disconnected).length, 2, 'un solo ciclo de observación activo tras la recarga');
   ok('Recarga: historial recuperado desde el almacenamiento, sin pérdidas ni duplicados');
 
-  console.log(`\nTodas las pruebas del observador pasaron (${n}/11).`);
+  // 12. Mensajes bajo identidad provisional WEB:{uuid} y paso a la definitiva SIN
+  // reemplazar el contenedor DOM: mismos mensajes, registros migrados, sin duplicados.
+  const wrapperProv = el('section');
+  wrapperProv.appendChild(turn(1, 'user', 'p-u1', [txt('Mensaje con identidad provisional')]));
+  wrapperProv.appendChild(turn(2, 'assistant', 'p-a1', [txt('Respuesta con identidad provisional')]));
+  wrapperR.remove(); mainR.appendChild(wrapperProv);
+  global.location.pathname = '/c/WEB:12345678-1234-1234-1234-123456789abc';
+  fireStructure(); await sleep(1200);
+  assert.ok(leafText('Mensajes leídos: 2'), 'con identidad provisional se lee el primer intercambio: ' + leafText('Mensajes leídos:'));
+  assert.strictEqual(A2.lastDetect().conversationId, 'WEB:12345678-1234-1234-1234-123456789abc', 'identidad provisional completa, sin truncar');
+  assert.strictEqual(A2.identityKind(A2.conversationId()), 'provisional');
+  assert.ok(A2.lastDetect().messages.every((m) => m.uid.startsWith('WEB:12345678-1234-1234-1234-123456789abc::')));
+  global.location.pathname = '/c/definitivo-prov-1'; // solo cambia la ruta; el DOM es el mismo
+  fireStructure(); await sleep(1200);
+  assert.ok(leafText('Mensajes leídos: 2'), 'al llegar la identidad definitiva el conteo no cambia: ' + leafText('Mensajes leídos:'));
+  assert.strictEqual(A2.lastDetect().conversationId, 'definitivo-prov-1');
+  assert.ok(A2.lastDetect().messages.every((m) => m.uid.startsWith('definitivo-prov-1::')), 'los mismos mensajes quedan bajo la identidad definitiva');
+  const seenDefinitivo = Object.keys(storageData['evo_state_v1'].projects[storageData['evo_state_v1'].active].seen).filter((k) => k.startsWith('definitivo-prov-1::'));
+  assert.strictEqual(seenDefinitivo.length, 2, 'registros migrados a la identidad definitiva sin duplicar (2, no 4)');
+  ok('Provisional WEB:{uuid} → definitiva sin reemplazar el contenedor: migración sin duplicados');
+
+  // 13. Reemplazo del contenedor SIN cambio de ruta: se lee el contenedor nuevo, misma identidad
+  const wrapperProv2 = el('section');
+  wrapperProv2.appendChild(turn(1, 'user', 'p-u1', [txt('Mensaje con identidad provisional')]));
+  wrapperProv2.appendChild(turn(2, 'assistant', 'p-a1', [txt('Respuesta con identidad provisional')]));
+  wrapperProv2.appendChild(turn(3, 'user', 'p-u2', [txt('Mensaje posterior en el contenedor nuevo')]));
+  wrapperProv.remove(); mainR.appendChild(wrapperProv2);
+  fireStructure(); await sleep(1200);
+  assert.ok(leafText('Mensajes leídos: 3'), 'el contenedor reemplazado se lee con la misma identidad: ' + leafText('Mensajes leídos:'));
+  assert.strictEqual(A2.lastDetect().conversationId, 'definitivo-prov-1');
+  ok('Reemplazo del contenedor sin cambio de ruta: lectura nueva, identidad conservada');
+
+  // 14. Regreso a una conversación anterior: registros separados, sin mezclar ni duplicar
+  const wrapperVuelta = el('section');
+  wrapperVuelta.appendChild(turn(1, 'user', 's-u1', [txt('Mensaje descubierto por seguridad')]));
+  wrapperVuelta.appendChild(turn(2, 'assistant', 's-a1', [txt('Respuesta descubierta por seguridad')]));
+  wrapperProv2.remove(); mainR.appendChild(wrapperVuelta);
+  global.location.pathname = '/c/conv-seguridad';
+  fireStructure(); await sleep(1200);
+  assert.ok(leafText('Mensajes leídos: 2'), 'al volver, se lee solo la conversación anterior: ' + leafText('Mensajes leídos:'));
+  assert.deepStrictEqual(A2.getMessages().map((m) => m.text), ['Mensaje descubierto por seguridad', 'Respuesta descubierta por seguridad']);
+  assert.strictEqual(seenSeguridad().length, 2, 'el regreso no duplica los registros de esa conversación');
+  ok('Regreso a una conversación anterior sin mezclar registros');
+
+  // 15. pushState y popstate: transición SPA detectada sin disparar ningún observador
+  const wrapperPush = el('section');
+  wrapperPush.appendChild(turn(1, 'user', 'h-u1', [txt('Mensaje llegado por pushState')]));
+  wrapperPush.appendChild(turn(2, 'assistant', 'h-a1', [txt('Respuesta llegada por pushState')]));
+  wrapperVuelta.remove(); mainR.appendChild(wrapperPush);
+  global.history.pushState(null, '', '/c/conv-push'); // cambia la ruta; nadie avisa a los observadores
+  await sleep(1000);
+  assert.ok(leafText('Mensajes leídos: 2'), 'pushState: la conversación nueva se lee sola: ' + leafText('Mensajes leídos:'));
+  assert.strictEqual(A2.lastDetect().conversationId, 'conv-push');
+  const wrapperVuelta2 = el('section');
+  wrapperVuelta2.appendChild(turn(1, 'user', 's-u1', [txt('Mensaje descubierto por seguridad')]));
+  wrapperVuelta2.appendChild(turn(2, 'assistant', 's-a1', [txt('Respuesta descubierta por seguridad')]));
+  wrapperPush.remove(); mainR.appendChild(wrapperVuelta2);
+  global.location.pathname = '/c/conv-seguridad'; // el navegador ya actualizó la URL al volver
+  for (const fn of routeListeners['popstate'] || []) fn({});
+  await sleep(1000);
+  assert.ok(leafText('Mensajes leídos: 2'), 'popstate: se vuelve a leer la conversación anterior: ' + leafText('Mensajes leídos:'));
+  assert.strictEqual(A2.lastDetect().conversationId, 'conv-seguridad');
+  ok('pushState/popstate detectados sin observadores y con lectura inmediata');
+
+  console.log(`\nTodas las pruebas del observador pasaron (${n}/15).`);
 })().catch((e) => { console.error('FALLÓ:', e); process.exit(1); });

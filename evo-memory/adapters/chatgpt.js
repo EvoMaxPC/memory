@@ -87,7 +87,32 @@
     || (attr(el, 'data-markdown-text-style') === 'assistant-message' ? 'assistant' : null)
     || (attr(el, 'data-assistant-markdown') !== null || attr(el, 'data-assistant-markdown-root') !== null ? 'assistant' : null)
     || (attr(el, 'data-chatgpt-agent-turn-start') !== null ? 'assistant' : null);
-  const currentConversationId = () => (location.pathname.match(/\/c\/([\w-]+)/) || [])[1] || 'nueva';
+  // ---- Identidad de la conversación activa: única fuente de verdad ----
+  // Rutas reales: /c/{id}, /uc/{id} y la provisional /c/WEB:{uuid}. El identificador puede
+  // contener ':' y NUNCA se trunca: 'WEB:{uuid}' identifica a UNA conversación provisional;
+  // truncarlo a 'WEB' reutilizaría una identidad genérica y mezclaría chats provisionales.
+  const routeConversationId = () => {
+    const m = String((location && location.pathname) || '').match(/^\/(?:c|uc)\/([^/?#]+)/);
+    if (!m) return null;
+    try { return decodeURIComponent(m[1]) || null; } catch (e) { return m[1]; }
+  };
+  // Toda identidad es de un tipo: 'temporal' (chat nuevo aún sin ID en la ruta),
+  // 'provisional' (WEB:{uuid}, única de esa conversación pero reemplazable por la definitiva)
+  // o 'definitiva' (el ID de la ruta /c/ o /uc/).
+  const identityKind = (id) => {
+    if (!id || id === 'nueva' || /^nueva-\d+$/.test(id)) return 'temporal';
+    if (/^WEB:/i.test(id)) return 'provisional';
+    return 'definitiva';
+  };
+  // Sin ID en la ruta, el chat nuevo recibe una identidad temporal PROPIA por episodio:
+  // dos conversaciones nuevas todavía sin ID no comparten identidad entre sí.
+  let temporalSeq = 0, temporalId = null;
+  function currentConversationId() {
+    const routeId = routeConversationId();
+    if (routeId) { temporalId = null; return routeId; }
+    if (!temporalId) { temporalSeq++; temporalId = temporalSeq === 1 ? 'nueva' : 'nueva-' + temporalSeq; }
+    return temporalId;
+  }
   // Rótulos de atribución («You said:» / «ChatGPT said:») que ChatGPT pone junto al mensaje:
   // son interfaz, jamás el contenido ni un mensaje aparte.
   const isAttributionLabel = (el) => !!el && /^H[1-6]$/.test(el.tagName || '')
@@ -287,7 +312,7 @@
   };
   const nearestTurnKey = (el) => { for (let n = el; n; n = n.parentElement) if (attr(n, 'data-turn-key')) return n; return null; };
   function belongsToOtherConversation(cand, conversationId) {
-    if (!conversationId || conversationId === 'nueva') return false;
+    if (identityKind(conversationId) !== 'definitiva') return false; // sin ID definitivo no hay marca ajena verificable
     const root = cand.turnEl || cand.contentEl;
     const ids = [];
     const own = attr(root, 'data-chatgpt-selection-conversation-id');
@@ -369,10 +394,10 @@
     return out;
   }
   function extractEmbedded(conversationId) {
-    // Un chat nuevo todavía no tiene ID verificable. La página puede conservar en su estado
-    // inicial datos de la conversación anterior: aceptarlos contaría mensajes de otro chat.
-    // En «nueva» la lectura es solo DOM hasta que ChatGPT asigne el ID real de la conversación.
-    if (!conversationId || conversationId === 'nueva') return [];
+    // Sin ID definitivo (temporal o provisional WEB:) no hay ID verificable contra el JSON:
+    // la página puede conservar en su estado inicial datos de la conversación anterior y
+    // aceptarlos contaría mensajes de otro chat. Hasta el ID definitivo, la lectura es solo DOM.
+    if (identityKind(conversationId) !== 'definitiva') return [];
     let scripts = [];
     try { scripts = $$('script').filter((s) => (s.textContent || '').includes('"mapping"')); } catch (e) { return []; }
     const key = conversationId + ':' + scripts.reduce((a, s) => a + (s.textContent || '').length, 0);
@@ -380,11 +405,11 @@
     let found = [];
     for (const s of scripts) {
       const raw = (s.textContent || '').trim();
-      if (conversationId !== 'nueva' && !raw.includes(conversationId)) continue; // debe ser de ESTA conversación
+      if (!raw.includes(conversationId)) continue; // debe ser de ESTA conversación (ID definitivo ya verificado)
       let data;
       try { data = JSON.parse(raw); } catch (e) { continue; } // scripts JS (no JSON) se ignoran, sin inventar parseos
       for (const conv of collectConversations(data, [])) {
-        if (conv.conversation_id && conversationId !== 'nueva' && conv.conversation_id !== conversationId) continue;
+        if (conv.conversation_id && conv.conversation_id !== conversationId) continue;
         const msgs = branchMessages(conv);
         if (msgs.length) { found = msgs; break; }
       }
@@ -611,7 +636,7 @@
       streaming: messages.length ? stopButtons().length > 0 : false,
       containerFound: !!lastContainer, container: describeEl(lastContainer), scope: scopeName, probes,
       scrollContainerFound: !!scrollEl, scrollContainer: describeScroll(scrollEl),
-      conversationId: (location.pathname.match(/\/c\/([\w-]+)/) || [])[1] || 'nueva',
+      conversationId,
       reasons
     };
     return lastDetect;
@@ -681,6 +706,7 @@
       atributos_data: top(attrs, 15),
       testids: top(testids, 15),
       ruta: location.pathname.replace(/[\w-]{20,}/, '…'),
+      identidad_conversacion: d.conversationId, tipo_identidad: identityKind(d.conversationId),
       estrategia_mensajes: d.strategy,
       estado_deteccion: d.status,
       motivos: d.reasons,
@@ -701,7 +727,9 @@
 
   EVO.adapter = {
     name: 'chatgpt',
-    conversationId: () => (location.pathname.match(/\/c\/([\w-]+)/) || [])[1] || 'nueva',
+    conversationId: currentConversationId, // única fuente de verdad de la identidad activa
+    identityKind, // 'temporal' | 'provisional' | 'definitiva' para cualquier identidad
+    conversationIdentity: () => { const id = currentConversationId(); return { id, kind: identityKind(id) }; },
     isStreaming: () => stopButtons().length > 0,
     strategy: () => (lastDetect ? lastDetect.strategy : 'pendiente'),
     lastDetect: () => lastDetect,

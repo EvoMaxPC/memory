@@ -104,18 +104,31 @@
     });
     return dirty;
   }
-  // Al chat nuevo ChatGPT le asigna su id real después: los registros «nueva::*» pasan a ese id
+  // Cuando una conversación recibe su identidad definitiva, los registros guardados bajo la
+  // identidad anterior (temporal «nueva» o provisional «WEB:{uuid}») pasan a la definitiva
   // para que los mismos mensajes no se reprocesen como si fueran otros.
-  function migrateNewChatKeys(p, msgs, cid) {
+  function migrateIdentityKeys(p, msgs, fromId, cid) {
     for (const m of msgs) {
-      const oldK = 'nueva::' + m.id, newK = cid + '::' + m.id;
+      const oldK = fromId + '::' + m.id, newK = cid + '::' + m.id;
       if (p.seen[oldK] !== undefined && p.seen[newK] === undefined) p.seen[newK] = p.seen[oldK];
       if (p.analyzed && p.analyzed[oldK] !== undefined && p.analyzed[newK] === undefined) p.analyzed[newK] = p.analyzed[oldK];
     }
   }
+  // ¿La transición lastConv → cid es la MISMA conversación recibiendo identidad definitiva?
+  // Solo entonces se migran registros: temporal→ruta, o provisional WEB:→definitiva.
+  // Entre dos identidades definitivas (o dos provisionales distintas) son chats distintos.
+  function isIdentityUpgrade(fromId, cid) {
+    if (!fromId || fromId === cid || !A.identityKind) return false;
+    const from = A.identityKind(fromId), to = A.identityKind(cid);
+    return (from === 'temporal' && to !== 'temporal') || (from === 'provisional' && to === 'definitiva');
+  }
   function applyDetect(d, manual) {
     const p = P(), cid = A.conversationId();
-    if (lastConv === 'nueva' && cid !== 'nueva') { p.convs[cid] = 1; migrateNewChatKeys(p, d.messages, cid); } // el chat nuevo recibió su id real
+    if (isIdentityUpgrade(lastConv, cid)) { // misma conversación, identidad definitiva nueva
+      p.convs[cid] = 1;
+      migrateIdentityKeys(p, d.messages, lastConv, cid);
+      if (integrityByConv[lastConv] && !integrityByConv[cid]) integrityByConv[cid] = integrityByConv[lastConv];
+    }
     lastConv = cid;
     const silent = !p.convs[cid]; // al abrir un chat antiguo se aprende del historial sin lanzar alertas
     detectInfo = d; nMsgs = d.total;
@@ -187,6 +200,28 @@
     } else if (!contOk) { obsContainer = null; scan(); } // contenedor reconstruido, chat nuevo o mensajes recién cargados
     else if (A.isStreaming() !== wasStreaming) schedule(); // apareció/desapareció la señal de generación: reevaluar y, si terminó, analizar la versión final
   }
+  // Cambios de ruta SPA sin mutación útil del DOM: pushState/replaceState/popstate avisan
+  // y se reconcilia (lectura inmediata si cambió la conversación). Se instala UNA sola vez:
+  // no se duplican listeners ni se vuelven a envolver los métodos de history.
+  let routeHooked = false;
+  function queueReconcile() {
+    if (!detectionActive) return;
+    clearTimeout(structTimer);
+    structTimer = setTimeout(reconcileConversation, 300);
+  }
+  function hookRouteChanges() {
+    if (routeHooked) return;
+    routeHooked = true;
+    try {
+      const hist = globalThis.history;
+      if (hist && typeof hist.pushState === 'function') {
+        const origPush = hist.pushState, origReplace = hist.replaceState;
+        hist.pushState = function (...args) { const r = origPush.apply(this, args); queueReconcile(); return r; };
+        if (typeof origReplace === 'function') hist.replaceState = function (...args) { const r = origReplace.apply(this, args); queueReconcile(); return r; };
+      }
+    } catch (e) { /* sin history accesible: quedan el observador de estructura y la verificación de seguridad */ }
+    try { if (typeof globalThis.addEventListener === 'function') globalThis.addEventListener('popstate', queueReconcile); } catch (e) { /* idem */ }
+  }
   // Verificación de seguridad de baja frecuencia: no reemplaza a los observadores; evita que
   // una conversación nueva quede sin leer si una mutación no llegó o el contenedor cambió.
   function ensureSafetyTimer() {
@@ -210,6 +245,7 @@
     detectionActive = true;
     obsConv = A.conversationId();
     attachStructureObserver();
+    hookRouteChanges();
     ensureSafetyTimer();
     lastIngest = { nuevos: 0, antiguos: 0, actualizados: 0, manual: !!manual };
     try {
