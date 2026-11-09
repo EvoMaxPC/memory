@@ -358,4 +358,43 @@ d = A.detect();
 assert.strictEqual(d.integrity, 'unverified', 'sin mensajes: unverified');
 ok('Contenedor desplazable identificado e integridad parcial/no verificada sin recuperación');
 
-console.log(`\nTodas las pruebas de detección pasaron (${n}/20).`);
+// 21. Validación pedida: usuario corto + respuesta IA + usuario = EXACTAMENTE 3 reales, sin duplicados
+global.location.pathname = '/c/conv-tres';
+const doc3m = makeDoc([]);
+const tl3 = el('div', { 'data-app-action-timeline-scroll': '', role: 'region' }, '', [
+  el('div', { 'data-turn-key': 't-1' }, '', [
+    el('div', { 'data-content-search-unit-key': 'fallback-turn-0:0:user', 'data-chatgpt-search-message-ids': 'u-1' }, '', [
+      el('button', { 'data-user-message-bubble': 'true' }, '', [el('span', {}, 'Hola, necesito ayuda con mi PC'), el('button', {}, 'Editar')])
+    ]),
+    el('div', { 'data-content-search-unit-key': 'fallback-turn-0:1:assistant', 'data-chatgpt-search-message-ids': 'a-1' }, '', [
+      el('h5', { class: 'sr-only' }, 'ChatGPT said:'),
+      el('div', {}, 'Claro. Revisá este código:'),
+      el('pre', {}, '', [el('code', { class: 'language-js' }, 'const memoria = 16;')]),
+      el('button', {}, 'Copiar')
+    ])
+  ]),
+  el('div', { 'data-turn-key': 't-2' }, '', [
+    el('div', { 'data-content-search-unit-key': 'fallback-turn-1:0:user', 'data-chatgpt-search-message-ids': 'u-2' }, '', [
+      el('button', { 'data-user-message-bubble': 'true' }, '¿Y si el problema es la memoria RAM?')
+    ])
+  ]),
+  el('div', { 'data-turn-key': 't-vacio' }, '', [el('button', {}, 'Copiar')]) // contenedor sin contenido real
+]);
+doc3m._main.appendChild(tl3);
+doc3m._main.appendChild(el('nav', {}, '', [el('button', { 'data-user-message-bubble': 'true' }, 'Conversación del historial lateral')]));
+global.document = doc3m;
+d = A.detect();
+assert.strictEqual(d.total, 3, 'exactamente 3 mensajes reales: ' + JSON.stringify(d.messages.map((m) => [m.role, m.text])));
+assert.deepStrictEqual(d.messages.map((m) => m.role), ['user', 'assistant', 'user']);
+assert.strictEqual(d.messages[0].text, 'Hola, necesito ayuda con mi PC', 'sin el botón Editar ni interfaz');
+assert.ok(d.messages[1].text.includes('Claro. Revisá este código:') && d.messages[1].text.includes('const memoria = 16;'));
+assert.ok(!d.messages[1].text.includes('ChatGPT said:') && !d.messages[1].text.includes('Copiar'), 'sin rótulos ni botones de la interfaz');
+assert.strictEqual(d.messages[1].code[0].code, 'const memoria = 16;', 'código íntegro');
+assert.strictEqual(d.messages[2].text, '¿Y si el problema es la memoria RAM?');
+assert.strictEqual(new Set(d.messages.map((m) => m.uid)).size, 3, 'sin duplicados entre selectores');
+assert.ok(d.messages.every((m) => m.via && m.elemento), 'cada mensaje informa de qué elemento salió');
+const detalle = A.diagnose().mensajes_detalle;
+assert.strictEqual(detalle.length, 3, 'el detalle del diagnóstico coincide con los 3 mensajes');
+ok('Conversación U/IA/U: exactamente 3 reales con roles y contenidos correctos, sin duplicados ni interfaz');
+
+console.log(`\nTodas las pruebas de detección pasaron (${n}/21).`);
