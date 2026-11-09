@@ -23,6 +23,11 @@
   const newProject = (name) => EVO.ProjectStorage ? EVO.ProjectStorage.createProjectData(name)
     : ({ name, objective: '', nextStep: '', decisions: [], rules: [], failed: [], seen: {}, convs: {}, errFp: {}, code: [], alerts: [] });
   let S, ctx = 0, lastSig = '', lastConv = '', timer, stable = 0, nMsgs = 0, scans = 0, lastError = '', pendingChange = null;
+  let detectInfo = null, lastIngest = { nuevos: 0, actualizados: 0, manual: false };
+  // Motor en tiempo real: activo hasta que el usuario lo detiene (conserva el autoescaneo histórico).
+  let detectionActive = true, msgObserver = null, structObserver = null, obsContainer = null, obsConv = '';
+  let convState = 'esperando', lastUpdate = null, lastChangeAt = 0, procTimer = null, structTimer = null;
+  let dupEvitados = 0, erroresLectura = 0, mutPendientes = 0;
   const P = () => S.projects[S.active];
   const save = () => store ? store.saveState(S) : api.storage.local.set({ [KEY]: S });
   const addAlert = (kind, msg) => { const p = P(); p.alerts.unshift({ t: Date.now(), kind, msg }); p.alerts.length = Math.min(p.alerts.length, 40); };
@@ -62,32 +67,120 @@
     }
   }
 
-  function scanInner() {
-    const msgs = A.getMessages();
-    nMsgs = msgs.length;
-    const sig = msgs.length + ':' + (msgs.length ? msgs[msgs.length - 1].text.length : 0);
-    if (sig !== lastSig) { lastSig = sig; stable = 0; return schedule(); } // esperar a que el texto deje de cambiar
-    if (A.isStreaming() && ++stable < 5) return schedule(); // si el botón «detener» queda pegado, no bloquea para siempre
+  // Procesa mensajes ya detectados SIN duplicar: `seen` guarda la firma (largo) de cada id estable.
+  // Un mensaje cuyo texto creció se actualiza como el mismo mensaje, no como uno nuevo.
+  function ingest(msgs, silent) {
+    const p = P();
+    ctx = 0; let dirty = false; lastIngest = { nuevos: 0, actualizados: 0, manual: lastIngest.manual };
+    for (const m of msgs) {
+      ctx += EVO.estimateTokens(m.text);
+      const firma = m.text.length + ':' + m.code.reduce((a, b) => a + b.code.length, 0);
+      if (!p.seen[m.id]) { p.seen[m.id] = firma; dirty = true; lastIngest.nuevos++; analyze(m, silent); }
+      else if (p.seen[m.id] !== firma && p.seen[m.id] !== 1) { p.seen[m.id] = firma; dirty = true; lastIngest.actualizados++; }
+      else if (p.seen[m.id] === 1) { p.seen[m.id] = firma; dirty = true; } // formato viejo (solo presencia)
+      else dupEvitados++; // mismo id y mismo contenido: duplicado evitado, no se reprocesa
+    }
+    return dirty;
+  }
+  function applyDetect(d, manual) {
     const p = P(), cid = A.conversationId();
     if (lastConv === 'nueva' && cid !== 'nueva') p.convs[cid] = 1; // el chat nuevo recibió su id real
     lastConv = cid;
     const silent = !p.convs[cid]; // al abrir un chat antiguo se aprende del historial sin lanzar alertas
-    ctx = 0; let dirty = false;
-    for (const m of msgs) {
-      ctx += EVO.estimateTokens(m.text);
-      if (p.seen[m.id]) continue;
-      p.seen[m.id] = 1; dirty = true;
-      analyze(m, silent);
-    }
-    if (msgs.length && !p.convs[cid]) { p.convs[cid] = 1; dirty = true; }
+    detectInfo = d; nMsgs = d.total;
+    lastIngest.manual = !!manual;
+    let dirty = ingest(d.messages, silent);
+    if (d.messages.length && !p.convs[cid]) { p.convs[cid] = 1; dirty = true; }
     if (dirty) save();
+    lastSig = d.messages.length + ':' + (d.messages.length ? d.messages[d.messages.length - 1].text.length : 0);
+    lastUpdate = new Date();
+    convState = !d.total ? 'esperando' : (d.streaming || A.isStreaming()) ? 'procesando' : 'actualizada';
+    attachMessageObserver(); // si ChatGPT reemplazó el contenedor, se re-observa el nuevo
     render();
   }
-  function scan() {
-    scans++;
-    try { scanInner(); lastError = ''; } catch (e) { lastError = (e && e.message) || String(e); render(); }
+  function runDetect(manual) {
+    if (!A.detect) throw new Error('El adaptador no ofrece detección detallada (detect).');
+    return A.detect();
   }
-  const schedule = () => { clearTimeout(timer); timer = setTimeout(scan, 900); };
+  function scanInner() { applyDetect(runDetect(false), false); }
+  function scan() {
+    if (!detectionActive) return;
+    scans++;
+    try { scanInner(); lastError = ''; }
+    catch (e) { erroresLectura++; lastError = (e && e.message) || String(e); if (detectInfo) detectInfo.reasons = [...(detectInfo.reasons || []), 'Error de lectura: ' + lastError]; render(); }
+  }
+  // Mutaciones agrupadas (debounce): ni intervalos constantes ni un escaneo por mutación.
+  const schedule = () => { if (!detectionActive) return; clearTimeout(procTimer); procTimer = setTimeout(scan, 350); };
+  // Si dejó de llegar texto y no hay señal de generación, la respuesta queda "actualizada":
+  // es solo un indicio (ausencia de cambios + sin botón de detener), nunca una prueba absoluta.
+  const scheduleSettle = () => { clearTimeout(timer); timer = setTimeout(() => { if (detectionActive && !A.isStreaming() && detectInfo && detectInfo.total) { convState = 'actualizada'; render(); } }, 1600); };
+
+  // --- Observador de mensajes: solo el contenedor de la conversación (no toda la página) ---
+  function attachMessageObserver() {
+    if (!detectionActive) return;
+    const cont = A.conversationContainer ? A.conversationContainer() : null;
+    if (cont && cont === obsContainer && msgObserver) return;
+    if (msgObserver) { msgObserver.disconnect(); msgObserver = null; }
+    obsContainer = cont || null;
+    if (!cont) return;
+    msgObserver = new MutationObserver((muts) => {
+      if (!detectionActive) return;
+      // Ignorar mutaciones irrelevantes: las del propio panel EVO (vive fuera del contenedor y en shadow DOM)
+      const relevantes = muts.filter((mu) => !(mu.target && mu.target.closest && mu.target.closest('[data-evo-memory]')));
+      if (!relevantes.length) return;
+      mutPendientes += relevantes.length; lastChangeAt = Date.now();
+      if (convState !== 'procesando') convState = A.isStreaming() ? 'procesando' : convState;
+      schedule(); scheduleSettle();
+    });
+    msgObserver.observe(cont, { childList: true, subtree: true, characterData: true });
+  }
+  // --- Observador de estructura: contenedor reemplazado, navegación SPA y cambios de URL ---
+  function attachStructureObserver() {
+    if (structObserver || !document.body) return;
+    structObserver = new MutationObserver(() => {
+      if (!detectionActive) return;
+      clearTimeout(structTimer);
+      structTimer = setTimeout(() => { // chequeo barato y agrupado, sin reescanear por cada mutación
+        if (!detectionActive) return;
+        const cid = A.conversationId();
+        const contOk = obsContainer && document.contains(obsContainer);
+        if (cid !== obsConv) { // cambio de conversación: separar registros y re-observar, sin borrar nada
+          obsConv = cid; obsContainer = null;
+          if (msgObserver) { msgObserver.disconnect(); msgObserver = null; }
+          lastSig = ''; convState = 'esperando';
+          say(`Conversación cambiada (${cid}): se separan los mensajes de esta conversación; los registros anteriores se conservan.`);
+          scan();
+        } else if (!contOk) { obsContainer = null; scan(); } // contenedor reconstruido o mensajes recién cargados
+      }, 500);
+    });
+    structObserver.observe(document.body, { childList: true, subtree: true });
+  }
+  function startDetection(manual) {
+    detectionActive = true;
+    obsConv = A.conversationId();
+    attachStructureObserver();
+    lastIngest = { nuevos: 0, actualizados: 0, manual: !!manual };
+    try {
+      const d = runDetect(!!manual); // escaneo inmediato y completo de lo disponible en el DOM
+      applyDetect(d, !!manual);
+      say(d.status === 'fallido' ? 'Detección iniciada, pero no se encontraron mensajes. Revisá el detalle bajo los botones.'
+        : `Detección activa: ${d.total} mensajes únicos (${lastIngest.nuevos} nuevos, ${lastIngest.actualizados} actualizados).`);
+    } catch (e) {
+      erroresLectura++;
+      detectInfo = { status: 'fallido', strategy: 'ninguna', total: 0, user: 0, assistant: 0, withCode: 0, chars: 0, tokens: 0, selectorCounts: {}, duplicates: 0, skippedEmpty: 0, unclassified: 0, reconciliados: 0, containerFound: false, container: 'no encontrado', streaming: false, conversationId: A.conversationId(), reasons: ['Error al analizar el DOM: ' + ((e && e.message) || String(e))] };
+      nMsgs = 0; render();
+      say('Detección fallida: ' + ((e && e.message) || String(e)));
+    }
+  }
+  function stopDetection() {
+    detectionActive = false;
+    if (msgObserver) { msgObserver.disconnect(); msgObserver = null; }
+    if (structObserver) { structObserver.disconnect(); structObserver = null; }
+    clearTimeout(procTimer); clearTimeout(timer); clearTimeout(structTimer);
+    render(); // los registros y contadores existentes se conservan
+    say('Detección detenida: no se observan nuevos cambios. Los registros existentes se conservan.');
+  }
+  const manualDetect = () => startDetection(true);
 
   // ---------- Contexto que se entrega a la IA ----------
   // Contexto protegido completo (sin resumir el objetivo) construido por context/context-builder.js.
@@ -127,6 +220,7 @@
     .bar.w i{background:var(--wn)}.bar.b i{background:#d1344a}
     .a{padding:6px 8px;margin:4px 0;border-left:3px solid var(--wn);background:rgba(154,91,0,.08);border-radius:0 6px 6px 0}
     .d{white-space:pre-wrap;font:11px/1.3 monospace;margin:8px 0 0;color:var(--mu)}
+    .det{white-space:pre-wrap;word-break:break-word;border:1px solid var(--bd);border-radius:6px;padding:6px}
     .acts{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}` + (EVO.ObjectivePanel ? EVO.ObjectivePanel.STYLES : '');
 
   const refs = {};
@@ -206,7 +300,8 @@
   const fill = () => { refs.next.value = P().nextStep; if (refs.pObj) { delete refs.pObj.dataset.editing; refs.pObj.value = P().protectedData ? P().protectedData.objective.value : ''; } };
 
   function build() {
-    const host = h('div'), root = host.attachShadow({ mode: 'open' });
+    const host = h('div'); host.setAttribute('data-evo-memory', 'panel'); // el adaptador excluye este nodo de la detección
+    const root = host.attachShadow({ mode: 'open' });
     const adder = (ph, fn) => {
       const i = h('input', { placeholder: ph });
       const add = () => { const v = i.value.trim(); if (v) { fn(v); i.value = ''; save(); render(); } };
@@ -215,6 +310,8 @@
     };
     Object.assign(refs, {
       status: h('div', { className: 'm' }), live: h('div', { className: 'm' }), meter: h('div', { className: 'm' }), bar: h('div', { className: 'bar' }, h('i')),
+      detect: h('div', { className: 'm det', textContent: 'Detección: todavía no ejecutada. Pulsá «Iniciar detección».' }),
+      detState: h('div', { className: 'm' }),
       alerts: h('div'), diag: h('pre', { className: 'd' }), dec: h('ul'), rul: h('ul'), fail: h('ul'),
       proj: h('select', { onchange: () => { S.active = refs.proj.value; pendingChange = null; save(); fill(); render(); } }),
       next: h('textarea', { rows: 2, placeholder: 'Qué sigue, en una frase', onchange: () => { P().nextStep = refs.next.value; save(); } })
@@ -222,6 +319,8 @@
     const panel = h('div', { className: 'p' },
       h('div', { className: 'row' }, h('b', { textContent: 'EVO Memory ' + VERSION }), refs.proj, h('button', { textContent: 'Nuevo', onclick: newProj })),
       refs.bar, refs.meter, refs.live, refs.status,
+      h('div', { className: 'row' }, h('button', { textContent: 'Iniciar detección', onclick: () => startDetection(true) }), h('button', { textContent: 'Detener detección', onclick: stopDetection })),
+      refs.detState, refs.detect,
       EVO.ObjectivePanel ? EVO.ObjectivePanel.build(h, refs, panelActions) : h('div', { className: 'm', textContent: '⚠ Módulo de datos protegidos no cargado.' }),
       h('h4', { textContent: 'Alertas' }), refs.alerts,
       h('h4', { textContent: 'Decisiones confirmadas' }), refs.dec, adder('Decisión (se copia tal cual)', (v) => P().decisions.push(v)),
@@ -243,7 +342,24 @@
   function render() {
     const p = P(), pct = Math.min(100, Math.round((ctx / LIMIT) * 100));
     refs.proj.replaceChildren(...Object.entries(S.projects).map(([id, v]) => h('option', { value: id, textContent: v.name, selected: id === S.active })));
-    refs.live.textContent = `Detectados: ${nMsgs} mensajes (estrategia: ${A.strategy()}) · escaneos: ${scans}` + (lastError ? ` · ERROR: ${lastError}` : '');
+    refs.live.textContent = `Detectados: ${nMsgs} mensajes` + (detectInfo ? ` (${detectInfo.user} de usuario · ${detectInfo.assistant} de IA · estrategia: ${detectInfo.strategy})` : ` (estrategia: ${A.strategy()})`) + ` · escaneos: ${scans}` + (lastError ? ` · ERROR: ${lastError}` : '');
+    if (refs.detState) refs.detState.textContent = detectionActive
+      ? `● Detección activa · estado de la conversación: ${convState}${convState === 'procesando' ? ' (la respuesta se está generando; el mismo registro se actualiza)' : convState === 'actualizada' ? ' (sin cambios recientes y sin señal de generación: indicio, no prueba de fin)' : ' (sin mensajes nuevos)'} · última actualización: ${lastUpdate ? lastUpdate.toLocaleTimeString() : '—'}`
+      : '○ Detección detenida · los registros existentes se conservan';
+    if (refs.detect && detectInfo) {
+      const d = detectInfo, estado = d.status === 'fallido' ? '❌ DETECCIÓN FALLIDA' : d.status === 'parcial' ? '⚠ ANÁLISIS PARCIAL (solo lo cargado en el DOM)' : '✓ Cobertura: DOM disponible completo (no garantiza mensajes fuera del DOM)';
+      refs.detect.textContent = [
+        `${estado} · conversación: ${d.conversationId}`,
+        `Contenedor de conversación: ${d.containerFound ? d.container : 'no encontrado'} · observadores: ${detectionActive ? `estructura ${structObserver ? 'activo' : 'inactivo'} · mensajes ${msgObserver ? 'activo (' + (d.container || '') + ')' : 'sin contenedor'}` : 'detenidos'}`,
+        `Total únicos: ${d.total} · usuario: ${d.user} · IA: ${d.assistant} · con código: ${d.withCode}`,
+        `Caracteres: ${d.chars.toLocaleString()} · tokens estimados: ${d.tokens.toLocaleString()}`,
+        `Estrategia: ${d.strategy} · por selector: ${Object.entries(d.selectorCounts || {}).map(([k, v]) => `${k}=${v}`).join(', ')}`,
+        `Nuevos: ${lastIngest.nuevos} · actualizados: ${lastIngest.actualizados} · duplicados evitados (sesión): ${dupEvitados} · en este escaneo: ${d.duplicates} · reconciliados: ${d.reconciliados || 0}${lastIngest.manual ? ' · (escaneo manual)' : ''}`,
+        `Descartados: vacíos/carga ${d.skippedEmpty} · sin rol ${d.unclassified} · errores de lectura: ${erroresLectura}${lastError ? ' · último error: ' + lastError : ''}`,
+        ...(d.reasons || []).map((r) => '• ' + r),
+        'La lectura cubre solo los mensajes presentes en el DOM; si ChatGPT no cargó el historial completo, el análisis es parcial. Ningún mensaje detectado se convierte solo en decisión confirmada ni toca los datos protegidos.'
+      ].join('\n');
+    }
     refs.bar.className = 'bar' + (pct >= 90 ? ' b' : pct >= 70 ? ' w' : '');
     refs.bar.firstChild.style.width = pct + '%';
     refs.meter.textContent = `Contexto de esta conversación: ~${ctx.toLocaleString()} tokens (estimación)` + (pct >= 70 ? '. Conviene traspasar a un chat nuevo.' : '');
@@ -257,7 +373,7 @@
   (async () => {
     if (store) { S = await store.loadState(); await save(); } // loadState migra proyectos v0.1 sin perder datos
     else { const r = await api.storage.local.get(KEY); S = r[KEY] || { active: 'default', projects: { default: newProject('Proyecto 1') } }; }
-    build(); fill(); scan();
-    new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true, characterData: true });
+    build(); fill();
+    startDetection(false); // detección activa desde la carga (comportamiento histórico) hasta que el usuario la detenga
   })();
 })();
