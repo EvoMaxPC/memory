@@ -240,4 +240,20 @@ assert.strictEqual(dA2.messages[1].code[0].code, 'let a = 1;');
 assert.strictEqual(dA2.messages[0].text, 'Misma pregunta en dos chats');
 ok('Cada mensaje asociado a su conversación, uid único entre chats y regreso sin mezclar');
 
-console.log(`\nTodas las pruebas de detección pasaron (${n}/14).`);
+// 15. Fallo real reportado: <main> vacío y la conversación en otro contenedor del documento.
+// Antes el adaptador quedaba ciego (todo 0); ahora amplía el ámbito al documento completo.
+global.location.pathname = '/c/conv-fuera-de-main';
+const docF = makeDoc([]); // main vacío
+const fuera = el('div', {}, '', [
+  turn(1, 'user', 'f-1', [txt('Mensaje fuera del primer main')]),
+  el('article', { 'data-testid': 'conversation-turnX', 'data-turn-id': 'tx-2' }, '', [el('div', { 'data-message-author-role': 'assistant', 'data-message-id': 'f-2' }, 'Respuesta fuera del primer main')])
+]);
+docF._main.parentElement.appendChild(fuera); // queda en <body>, fuera de <main>
+global.document = docF;
+d = A.detect();
+assert.strictEqual(d.total, 2, 'debe encontrar los mensajes aunque no estén en el primer <main>');
+assert.ok(d.scope.includes('documento'), 'el ámbito debe informar que se amplió al documento: ' + d.scope);
+assert.deepStrictEqual([d.user, d.assistant], [1, 1]);
+ok('Mensajes fuera del primer <main>: el ámbito se amplía y se detectan (fallo de «todo 0»)');
+
+console.log(`\nTodas las pruebas de detección pasaron (${n}/15).`);

@@ -23,7 +23,9 @@
     { name: 'author-role', sel: '[data-message-author-role]', kind: 'direct' },
     { name: 'article-data-turn', sel: 'article[data-turn]', kind: 'turn' },
     { name: 'conversation-turn', sel: '[data-testid^="conversation-turn-"]', kind: 'turn' },
+    { name: 'conversation-turn-amplio', sel: '[data-testid^="conversation-turn"]', kind: 'turn' },
     { name: 'data-turn', sel: '[data-turn]', kind: 'turn' },
+    { name: 'turn-id', sel: '[data-turn-id]', kind: 'turn' },
     { name: 'turn-key', sel: '[data-turn-key]', kind: 'turn' },
     { name: 'search-unit', sel: '[data-content-search-unit-key]', kind: 'turn' },
     { name: 'user-bubble', sel: '[data-user-message-bubble]', kind: 'direct' },
@@ -111,10 +113,9 @@
   // contenedor alternativo en silencio; el diagnóstico lo informa y no se observa un nodo parcial.
   function commonContainer(els, scope) {
     if (!els.length) return null;
-    let node = els[0];
-    while (node !== scope && node.parentElement && els.every((e) => node.parentElement.contains(e))) node = node.parentElement;
-    if (els.every((e) => node.contains(e))) return node;
-    return scope && els.every((e) => scope.contains(e)) ? scope : null;
+    for (let n = els[0]; n; n = n.parentElement) if (els.every((e) => n.contains(e))) return n; // ancestro común más profundo
+    const eff = scope && scope.contains ? scope : (document.body || document.documentElement || null); // scope=document
+    return eff && els.every((e) => eff.contains(e)) ? eff : null;
   }
   const describeEl = (el) => el ? `${el.tagName.toLowerCase()}${el.id ? '#' + el.id : ''}${attr(el, 'data-testid') ? `[data-testid="${attr(el, 'data-testid')}"]` : ''}` : 'no encontrado';
 
@@ -161,9 +162,18 @@
   }
 
   function detect() {
-    const scope = scopeRoot(), selectorCounts = {};
+    // Ámbito: se prefiere <main>, pero si ahí no aparece NINGÚN elemento candidato y en el resto
+    // del documento sí, se busca en el documento completo (p. ej. si ChatGPT movió la conversación
+    // fuera del primer <main>). Quedarse solo con un <main> vacío fue un fallo real reportado:
+    // mensajes visibles en la página y todos los contadores en 0.
+    let scope = scopeRoot(), scopeName = scope === document ? 'documento' : 'main';
+    const hits = (sc) => { try { return STRATEGIES.reduce((a, s) => a + $$(s.sel, sc).length, 0); } catch (e) { return 0; } };
+    if (scope !== document && hits(scope) === 0 && hits(document) > 0) { scope = document; scopeName = 'documento (el <main> no contenía mensajes)'; }
+    const selectorCounts = {};
     const conversationId = (location.pathname.match(/\/c\/([\w-]+)/) || [])[1] || 'nueva';
     for (const s of STRATEGIES) { try { selectorCounts[s.name] = $$(s.sel, scope).length; } catch (e) { selectorCounts[s.name] = 0; } }
+    let probes = {};
+    try { probes = { article: $$('article', document).length, conTestid: $$('[data-testid]', document).length, conRol: $$('[data-message-author-role], [data-conversation-role], [data-message-role]', document).length }; } catch (e) { /* sondeo no disponible */ }
     let messages = [], chosenEls = [], duplicates = 0, unclassified = 0, skippedEmpty = 0, reconciliados = 0;
     const cands = allCandidates(scope);
     const turnRoleTotal = new Map(), turnRoleSeen = new Map();
@@ -209,6 +219,7 @@
       reasons.push('No se encontró ningún mensaje con las estructuras conocidas ([data-message-author-role], article[data-turn], [data-testid^="conversation-turn-"], [data-turn-key], [data-content-search-unit-key], [data-user-message-bubble], [data-conversation-role], [data-chatgpt-agent-turn-start], [data-markdown-text-style="assistant-message"], transcripción li[data-message-role]). El DOM de esta página no es compatible con las variantes conocidas o todavía no cargó la conversación.');
       reasons.push(document.querySelector('main') ? 'La página tiene <main> pero sin mensajes reconocibles: puede ser un chat vacío, la sesión no cargó la conversación o ChatGPT cambió su estructura. Abrí una conversación con mensajes y reintentá; si persiste, copiá el «Diagnóstico».'
         : 'Ni siquiera se encontró el contenedor <main>: la conversación no terminó de cargar o no estás en una página de chat.');
+      reasons.push(`Sondeo en todo el documento: <article>=${probes.article ?? '?'}, elementos con data-testid=${probes.conTestid ?? '?'}, elementos con rol de mensaje=${probes.conRol ?? '?'}. Ámbito usado: ${scopeName}. Si el sondeo también da 0 con mensajes visibles, ChatGPT está usando una estructura no conocida: enviá la salida del botón «Diagnóstico» para ajustar el adaptador con datos reales.`);
     } else {
       const streaming = stopButtons().length > 0;
       if (streaming) reasons.push('La IA está generando una respuesta: su texto puede seguir cambiando y se actualizará sin contarse como mensaje nuevo.');
@@ -227,7 +238,7 @@
       withCode: messages.filter((m) => m.code.length).length,
       chars, tokens, selectorCounts, duplicates, unclassified, skippedEmpty, reconciliados,
       streaming: messages.length ? stopButtons().length > 0 : false,
-      containerFound: !!lastContainer, container: describeEl(lastContainer),
+      containerFound: !!lastContainer, container: describeEl(lastContainer), scope: scopeName, probes,
       conversationId: (location.pathname.match(/\/c\/([\w-]+)/) || [])[1] || 'nueva',
       reasons
     };
@@ -289,7 +300,7 @@
       mensajes_con_codigo: d.withCode,
       caracteres: d.chars, tokens_estimados: d.tokens,
       duplicados_descartados: d.duplicates, sin_rol_omitidos: d.unclassified, vacios_omitidos: d.skippedEmpty,
-      reconciliados: d.reconciliados, contenedor_conversacion: d.container, cobertura: d.status,
+      reconciliados: d.reconciliados, contenedor_conversacion: d.container, cobertura: d.status, ambito_busqueda: d.scope, sondeo: d.probes,
       cuadro_texto: c ? c.n : 'NO ENCONTRADO',
       transmitiendo: stopButtons().length > 0,
       botones_detener: stopButtons().map((b) => b.getAttribute('aria-label') || b.getAttribute('data-testid')),
