@@ -1,21 +1,53 @@
 // Adaptador de ChatGPT. TODO lo específico del sitio vive SOLO aquí.
-// Detecta los mensajes con varias estrategias (de la más precisa a la más general), para que un
-// cambio menor en la página no deje a la extensión ciega. El botón «Diagnóstico» del panel muestra
-// qué estrategia está funcionando.
+// Detección de mensajes (orden de prioridad, sin clases CSS generadas ni índices como identidad):
+//   1) [data-message-author-role="user"|"assistant"]  → el mensaje individual y su rol real.
+//   2) article[data-turn]                             → turno; el rol sale del mensaje interno o de data-turn.
+//   3) [data-testid^="conversation-turn-"]            → turno; idem.
+//   4) [data-turn]                                    → último recurso estructural.
+// Un turno NO se cuenta como mensaje si adentro hay mensajes individuales: se leen esos.
+// Identidad estable: data-message-id → data-turn-id/testid del turno + rol → id de nodo + rol →
+// huella del inicio del contenido + posición (nunca solo el índice). Si el texto crece durante la
+// generación, la identidad no cambia y el contenido se actualiza sin contar un mensaje nuevo.
+// La búsqueda se limita a <main> (o al documento si no hay main): el panel EVO vive fuera de main
+// y además se excluye cualquier nodo dentro de [data-evo-memory]. No se usan APIs privadas.
 (function (root) {
   const EVO = (root.EVO = root.EVO || {});
   const $$ = (s, r = document) => [...r.querySelectorAll(s)];
   const outer = (els) => els.filter((e) => !els.some((o) => o !== e && o.contains(e)));
   const hash = (s) => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); };
+  const attr = (el, n) => (el && el.getAttribute ? el.getAttribute(n) : null);
 
+  // Variantes conocidas de la interfaz: anteriores, recientes y transcripción. El rol NUNCA se
+  // deduce por posición ni alternancia: sale de atributos semánticos o no se clasifica.
   const STRATEGIES = [
-    { name: 'author-role', sel: '[data-message-author-role]', role: (el) => el.getAttribute('data-message-author-role') },
-    { name: 'data-turn', sel: '[data-turn]', role: (el) => el.getAttribute('data-turn') },
-    { name: 'conversation-turn', sel: '[data-testid^="conversation-turn"]',
-      role: (el, i) => el.querySelector('[data-message-author-role="assistant"], .markdown') ? 'assistant'
-        : el.querySelector('[data-message-author-role="user"]') ? 'user' : (i % 2 ? 'assistant' : 'user') },
-    { name: 'article', sel: 'article', role: (el, i) => (el.querySelector('.markdown') || i % 2 ? 'assistant' : 'user') }
+    { name: 'author-role', sel: '[data-message-author-role]', kind: 'direct' },
+    { name: 'article-data-turn', sel: 'article[data-turn]', kind: 'turn' },
+    { name: 'conversation-turn', sel: '[data-testid^="conversation-turn-"]', kind: 'turn' },
+    { name: 'conversation-turn-amplio', sel: '[data-testid^="conversation-turn"]', kind: 'turn' },
+    { name: 'data-turn', sel: '[data-turn]', kind: 'turn' },
+    { name: 'turn-id', sel: '[data-turn-id]', kind: 'turn' },
+    { name: 'turn-key', sel: '[data-turn-key]', kind: 'turn' },
+    { name: 'search-unit', sel: '[data-content-search-unit-key]', kind: 'turn' },
+    { name: 'chatgpt-search-unit', sel: '[data-chatgpt-search-unit-key]', kind: 'turn' },
+    { name: 'search-turn-key', sel: '[data-content-search-turn-key]', kind: 'turn' },
+    { name: 'user-bubble', sel: '[data-user-message-bubble]', kind: 'direct' },
+    { name: 'conversation-role', sel: '[data-conversation-role]', kind: 'direct' },
+    { name: 'message-role', sel: '[data-message-role]', kind: 'direct' },
+    { name: 'agent-turn', sel: '[data-chatgpt-agent-turn-start]', kind: 'turn' },
+    { name: 'assistant-markdown', sel: '[data-markdown-text-style="assistant-message"]', kind: 'direct' },
+    { name: 'assistant-markdown-2', sel: '[data-assistant-markdown]', kind: 'direct' },
+    { name: 'assistant-markdown-root', sel: '[data-assistant-markdown-root]', kind: 'direct' },
+    { name: 'user-message-tone', sel: '[data-markdown-text-tone="user-message"]', kind: 'direct' },
+    { name: 'transcript', sel: 'li[data-message-role]', kind: 'transcript' },
+    { name: 'markdown-copy', sel: '[data-markdown-copy="contents"]', kind: 'direct' }
   ];
+  const INNER_MESSAGE_SEL = '[data-message-author-role], [data-conversation-role], [data-message-role], [data-user-message-bubble], [data-markdown-text-style="assistant-message"], [data-assistant-markdown], [data-assistant-markdown-root], [data-markdown-text-tone="user-message"], [data-markdown-copy="contents"], [data-content-search-unit-key], [data-chatgpt-search-unit-key]';
+  // Nodo que contiene SOLO lo que la persona escribió o SOLO la respuesta de la IA. Los
+  // contenedores (turno/unidad) sirven para identidad y orden, pero el texto se lee de acá:
+  // usuario -> burbuja; asistente -> contenido markdown copiable de la respuesta.
+  const USER_CONTENT_SELS = ['[data-user-message-bubble]', '[data-markdown-text-tone="user-message"]'];
+  const ASSISTANT_CONTENT_SELS = ['[data-markdown-copy="contents"]', '[data-markdown-text-style="assistant-message"]', '[data-assistant-markdown-root]', '[data-assistant-markdown]', '[data-message-author-role="assistant"]', '[data-conversation-role="assistant"]', '[data-message-role="assistant"]'];
+  const ID_ATTRS = ['data-message-id', 'data-turn-key', 'data-content-search-unit-key', 'data-turn-id'];
   const COMPOSERS = [
     ['prompt-textarea', '#prompt-textarea'],
     ['prosemirror', 'div.ProseMirror[contenteditable="true"]'],
@@ -23,29 +55,561 @@
     ['textarea', 'form textarea']
   ];
   const STOP_RE = /^(stop|detener|parar)\b/i, NOT_STOP = /(dictat|dictad|voice|voz|micr)/i;
+  let lastDetect = null, lastContainer = null;
+  // Identidad por elemento (WeakMap) y registro previo para reconciliar elementos reemplazados:
+  // solo se reutiliza un id si coinciden autor, posición relativa entre mensajes del mismo autor
+  // y la huella exacta del inicio del contenido. Textos "parecidos" nunca fusionan mensajes.
+  const elIdentity = new WeakMap();
+  let prevFingerprintRegistry = [];
 
-  const pick = () => { for (const s of STRATEGIES) { const els = outer($$(s.sel)); if (els.length) return { s, els }; } return null; };
+  const scopeRoot = () => document.querySelector('main') || document;
+  const inEvo = (el) => { for (let n = el; n; n = n.parentElement) if (attr(n, 'data-evo-memory')) return true; return false; };
+  const turnOf = (el) => {
+    for (let n = el.parentElement; n; n = n.parentElement) {
+      const tid = attr(n, 'data-testid');
+      if (attr(n, 'data-turn-id') || attr(n, 'data-turn-key') || attr(n, 'data-content-search-unit-key') || (tid && tid.startsWith('conversation-turn-')) || (n.tagName === 'ARTICLE' && attr(n, 'data-turn'))) return n;
+    }
+    return null;
+  };
+  const validRole = (r) => (r === 'user' || r === 'assistant' ? r : null);
+  // Rol explícito por semántica del atributo/elemento. Sin atributo reconocible -> null (no se inventa).
+  // En la interfaz actual la unidad de búsqueda trae el rol como sufijo de su clave: «…:user» / «…:assistant».
+  const unitKeyRole = (el) => {
+    const k = attr(el, 'data-content-search-unit-key') || attr(el, 'data-chatgpt-search-unit-key') || '';
+    const m = k.match(/[:\-](user|assistant)\s*$/i);
+    return m ? m[1].toLowerCase() : null;
+  };
+  const roleOf = (el) => validRole(attr(el, 'data-message-author-role') || attr(el, 'data-conversation-role') || attr(el, 'data-message-role') || attr(el, 'data-turn'))
+    || unitKeyRole(el)
+    || (attr(el, 'data-user-message-bubble') !== null ? 'user' : null)
+    || (attr(el, 'data-markdown-text-tone') === 'user-message' ? 'user' : null)
+    || (attr(el, 'data-markdown-copy') === 'contents' ? 'assistant' : null)
+    || (attr(el, 'data-markdown-text-style') === 'assistant-message' ? 'assistant' : null)
+    || (attr(el, 'data-assistant-markdown') !== null || attr(el, 'data-assistant-markdown-root') !== null ? 'assistant' : null)
+    || (attr(el, 'data-chatgpt-agent-turn-start') !== null ? 'assistant' : null);
+  const currentConversationId = () => (location.pathname.match(/\/c\/([\w-]+)/) || [])[1] || 'nueva';
+  // Rótulos de atribución («You said:» / «ChatGPT said:») que ChatGPT pone junto al mensaje:
+  // son interfaz, jamás el contenido ni un mensaje aparte.
+  const isAttributionLabel = (el) => !!el && /^H[1-6]$/.test(el.tagName || '')
+    && (attr(el, 'data-message-attribution') !== null || attr(el, 'data-conversation-role') !== null
+      || /^(you said|chatgpt said|dijiste|chatgpt dijo):?$/i.test((el.textContent || '').trim()));
+
+  function codeBlockValue(block) {
+    const inner = block.querySelector ? (block.querySelector('[data-language]') || block.querySelector('code') || block.querySelector('pre') || block) : block;
+    const target = inner && inner.tagName === 'PRE' && inner.querySelector ? (inner.querySelector('code') || inner) : inner;
+    const lineEls = target && target.children ? [...target.children].filter((c) => c.tagName === 'DIV') : [];
+    const code = lineEls.length && lineEls.every((c) => c.tagName === 'DIV')
+      ? lineEls.map((c) => c.textContent || '').join('\n')
+      : ((target && (target.innerText || target.textContent)) || '').replace(/\n+$/, '');
+    const langEl = block.querySelector ? (block.querySelector('[data-language]') || block.querySelector('code') || block) : block;
+    const cls = (langEl && langEl.className) || block.className || '';
+    const lang = attr(langEl, 'data-language') || (String(cls).match(/language-([\w+#-]+)/) || [])[1] || '';
+    return { lang, code };
+  }
+  function extractCode(contentEl) {
+    const out = [], seen = new Set();
+    const add = (b) => { if (b && b.code.trim() && !seen.has(b.code)) { seen.add(b.code); out.push(b); } };
+    for (const pre of $$('pre', contentEl)) add(codeBlockValue(pre));
+    for (const block of $$('[data-code-block]', contentEl)) {
+      if (block.querySelector && block.querySelector('pre')) continue; // ya contado como <pre>
+      add(codeBlockValue(block));
+    }
+    return out;
+  }
+  // Texto reconstruido desde los nodos del contenido (no desde el contenedor): conserva
+  // párrafos, listas y líneas de código sin depender del innerText de un clon desconectado.
+  function renderedText(root) {
+    if (!root) return '';
+    if (root.isConnected && typeof root.innerText === 'string') return root.innerText;
+    const BLOCK = new Set(['ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'DD', 'DETAILS', 'DIV', 'DL', 'DT', 'FIELDSET', 'FIGCAPTION', 'FIGURE', 'FOOTER', 'FORM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HEADER', 'HR', 'LI', 'MAIN', 'NAV', 'OL', 'P', 'SECTION', 'SUMMARY', 'TABLE', 'TBODY', 'TFOOT', 'THEAD', 'TR', 'UL']);
+    const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'SVG', 'TEXTAREA', 'INPUT', 'SELECT', 'BUTTON', 'ANNOTATION']);
+    const walk = (node, isRoot) => {
+      if (!node) return '';
+      if (node.nodeType === 3) return node.nodeValue || '';
+      if (node.nodeType && node.nodeType !== 1) return '';
+      const tag = node.tagName || '';
+      if (tag === 'PRE' || attr(node, 'data-code-block') !== null) return '\n' + codeBlockValue(node).code + '\n';
+      // La raíz sí puede ser la burbuja del usuario aunque sea un <button>: ahí vive su texto.
+      if ((SKIP.has(tag) && !(isRoot && attr(node, 'data-user-message-bubble') !== null)) || attr(node, 'data-markdown-copy') === 'exclude' || attr(node, 'aria-hidden') === 'true') return '';
+      if (String(node.className || '').split(/\s+/).includes('sr-only')) return '';
+      if (tag === 'BR') return '\n';
+      const kids = node.childNodes ? [...node.childNodes] : (node.children ? [...node.children] : []);
+      if (!kids.length) return node._text || node.textContent || '';
+      const inner = kids.map((k) => walk(k, false)).join('');
+      if (tag === 'TD' || tag === 'TH') return (node.previousElementSibling ? ' | ' : '') + inner.trim();
+      if (tag === 'LI' && !isRoot) {
+        const list = node.parentElement, items = list && list.children ? [...list.children].filter((c) => c.tagName === 'LI') : [];
+        const prefix = list && list.tagName === 'OL' ? `${Math.max(1, items.indexOf(node) + 1)}. ` : '- ';
+        return '\n' + prefix + inner.trim() + '\n';
+      }
+      if (BLOCK.has(tag) && !isRoot) return '\n' + inner + '\n';
+      return inner;
+    };
+    return walk(root, true).replace(/\r\n?/g, '\n').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n');
+  }
+  // Texto del mensaje desde su nodo de contenido: SIEMPRE sobre un clon sin interfaz.
+  // Se eliminan botones, menús, controles, iconos, partes marcadas como no copiables y los
+  // rótulos «You said:» / «ChatGPT said:»: eso es interfaz, no lo que la persona escribió ni
+  // la respuesta de la IA. Nunca se elimina la raíz aunque sea un button[data-user-message-bubble].
+  function visibleText(el) {
+    try {
+      const clone = el.cloneNode(true);
+      const isUserBubble = (n) => attr(n, 'data-user-message-bubble') !== null;
+      [...clone.querySelectorAll('button, [role="button"], nav, textarea, select, input, svg, script, style, [aria-hidden="true"], [data-markdown-copy="exclude"], h4[data-message-attribution], h4[data-conversation-role]')]
+        .filter((n) => !isUserBubble(n)).forEach((n) => n.remove());
+      $$('*', clone).filter((n) => String(n.className || '').split(/\s+/).includes('sr-only')).forEach((n) => n.remove());
+      $$('h1, h2, h3, h4, h5, h6', clone).filter((n) => /^(you said|chatgpt said|dijiste|chatgpt dijo):?$/i.test((n.textContent || '').trim())).forEach((n) => n.remove());
+      return renderedText(clone).replace(/^\s+/, '').replace(/\s+$/, '');
+    } catch (e) { return renderedText(el).replace(/^\s+/, '').replace(/\s+$/, ''); }
+  }
+  // Devuelve el/los nodos de contenido exacto dentro del candidato. Si el candidato es una
+  // unidad/turno, NO se lee el contenedor entero: se busca la burbuja del usuario o el
+  // contenido markdown de la IA. Solo sin ese nodo se usa el candidato (variantes anteriores).
+  function contentElementsFor(el, role) {
+    if (!el || !role) return [el];
+    const sels = role === 'user' ? USER_CONTENT_SELS : ASSISTANT_CONTENT_SELS;
+    for (const sel of sels) {
+      let found = [];
+      try { found = outer($$(sel, el)).filter((n) => !inEvo(n) && !isAttributionLabel(n)); } catch (e) { /* selector no disponible */ }
+      try { if (el.matches && el.matches(sel) && !isAttributionLabel(el)) found = [el, ...found.filter((n) => n !== el)]; } catch (e) { /* sin matches */ }
+      found = outer(found);
+      if (found.length) {
+        const codeNodes = [...$$('pre', el), ...$$('[data-code-block]', el)];
+        if (codeNodes.some((c) => !found.some((n) => n === c || n.contains(c) || c.contains(n)))) return [el]; // código fuera del nodo: se conserva el conjunto en orden
+        return found;
+      }
+    }
+    return [el];
+  }
+  // Navegación / barras laterales / encabezados nunca son mensajes de la conversación.
+  const inNavigation = (el) => {
+    for (let n = el; n; n = n.parentElement) {
+      if (n.tagName === 'NAV' || n.tagName === 'ASIDE') return true;
+      const r = attr(n, 'role');
+      if (r === 'navigation' || r === 'complementary' || r === 'banner') return true;
+    }
+    return false;
+  };
+  function stableId(contentEl, turnEl, role, text, pos, ctx) {
+    // 0) La interfaz actual lista el/los ids reales del mensaje en data-chatgpt-search-message-ids.
+    const mids = attr(contentEl, 'data-chatgpt-search-message-ids') || attr(turnEl, 'data-chatgpt-search-message-ids');
+    if (mids && mids.trim()) return 'msg:' + mids.trim().split(/[\s,]+/)[0];
+    // 1) Identificador propio del mensaje (elemento de contenido): es individual, no se comparte.
+    for (const a of ID_ATTRS) { const v = attr(contentEl, a); if (v) return (a === 'data-message-id' ? 'msg:' : 'key:' + a + ':') + v; }
+    // 2) Identificador del turno/contenedor: si el turno agrupa varios mensajes del mismo rol, se
+    //    agrega posición relativa en el turno + huella del inicio para NO fusionarlos entre sí.
+    for (const a of [...ID_ATTRS, 'data-testid']) {
+      const v = attr(turnEl, a);
+      if (v && turnEl !== contentEl) {
+        const base = (a === 'data-message-id' ? 'msg:' : 'turn:') + v + ':' + role;
+        return ctx.turnRoleTotal > 1 ? `${base}:${ctx.turnRolePos}:${hash(text.slice(0, 160))}` : base;
+      }
+    }
+    const nid = contentEl.id || (turnEl && turnEl.id);
+    if (nid) return 'node:' + nid + ':' + role + (ctx.turnRoleTotal > 1 ? ':' + ctx.turnRolePos + ':' + hash(text.slice(0, 160)) : '');
+    if (elIdentity.has(contentEl)) return elIdentity.get(contentEl); // mismo elemento DOM ya identificado
+    // Elemento reemplazado: reconciliar solo con evidencia exacta (autor + posición relativa + huella del inicio)
+    const ph = hash(text.slice(0, 160));
+    const prev = prevFingerprintRegistry.find((r) => r.role === role && r.ph === ph && r.rolePos === ctx.rolePos);
+    if (prev) { ctx.reconciliados++; return prev.id; }
+    return 'fp:' + role + ':' + pos + ':' + ph; // inicio del texto: estable si crece al final
+  }
+  // Ancestro común más profundo que contiene TODOS los mensajes (puede ser el propio ámbito/main).
+  // Si ningún ancestro los contiene a todos, devuelve null: jamás se usa el primer mensaje como
+  // contenedor alternativo en silencio; el diagnóstico lo informa y no se observa un nodo parcial.
+  function commonContainer(els, scope) {
+    if (!els.length) return null;
+    for (let n = els[0]; n; n = n.parentElement) if (els.every((e) => n.contains(e))) return n; // ancestro común más profundo
+    const eff = scope && scope.contains ? scope : (document.body || document.documentElement || null); // scope=document
+    return eff && els.every((e) => eff.contains(e)) ? eff : null;
+  }
+  const describeEl = (el) => el ? `${el.tagName.toLowerCase()}${el.id ? '#' + el.id : ''}${attr(el, 'data-testid') ? `[data-testid="${attr(el, 'data-testid')}"]` : ''}` : 'no encontrado';
+
+  // Candidatos de una estrategia: [{contentEl, turnEl, role}] sin inventar roles.
+  function candidatesFor(strategy, scope) {
+    const out = [];
+    if (strategy.kind === 'transcript') { // ol[data-conversation-transcript] > li[data-message-role] (hijos directos)
+      for (const list of outer($$('ol[data-conversation-transcript]', scope)).filter((e) => !inEvo(e)))
+        for (const li of [...list.children].filter((c) => c.tagName === 'LI' && attr(c, 'data-message-role') !== null && !inEvo(c)))
+          out.push({ contentEl: li, turnEl: li, role: roleOf(li), isTurn: false, strategy: strategy.name });
+      return out;
+    }
+    const els = outer($$(strategy.sel, scope)).filter((e) => !inEvo(e) && !isAttributionLabel(e));
+    if (strategy.kind === 'direct') {
+      for (const el of els) out.push({ contentEl: el, turnEl: turnOf(el) || el, role: roleOf(el), isTurn: false, strategy: strategy.name });
+      return out;
+    }
+    // Contenedores de turno/unidad: si adentro hay mensajes individuales, se leen ESOS (el turno no
+    // se cuenta como mensaje); si no hay, el contenedor solo se usa si su rol es semántico y claro.
+    for (const turn of els) {
+      const inside = outer($$(INNER_MESSAGE_SEL, turn)).filter((e) => !inEvo(e) && !isAttributionLabel(e));
+      if (inside.length) {
+        // El rol sale del propio elemento. Solo si el turno contiene UN único elemento y el turno
+        // trae rol semántico explícito, ese rol lo clasifica (no es una aproximación entre varios).
+        const turnRole = roleOf(turn);
+        for (const el of inside) out.push({ contentEl: el, turnEl: turn, role: roleOf(el) || (inside.length === 1 ? turnRole : null), isTurn: false, strategy: strategy.name });
+      }
+      else out.push({ contentEl: turn, turnEl: turn, role: roleOf(turn), isTurn: true, strategy: strategy.name });
+    }
+    return out;
+  }
+  // Unión de TODAS las estrategias, deduplicada por elemento: varios selectores pueden apuntar al
+  // mismo mensaje (p. ej. turno y su mensaje interno) y debe contarse una sola vez. El orden final
+  // es el orden del documento, no el de los selectores.
+  // ChatGPT deja en el DOM una línea de tiempo oculta (role="presentation", 0×0) y nodos de la
+  // conversación anterior: contarlos mezclaba chats. Solo se leen elementos efectivamente visibles.
+  let hiddenDiscarded = 0;
+  function isVisible(el) {
+    for (let n = el; n; n = n.parentElement) {
+      if (attr(n, 'hidden') !== null || attr(n, 'aria-hidden') === 'true' || attr(n, 'role') === 'presentation') return false;
+      const st = attr(n, 'style') || '';
+      if (/display\s*:\s*none|visibility\s*:\s*hidden/i.test(st)) return false;
+    }
+    try { if (typeof el.checkVisibility === 'function' && !el.checkVisibility()) return false; } catch (e) { /* se conserva */ }
+    return true;
+  }
+  const inInactivePage = (el) => {
+    for (let n = el; n; n = n.parentElement) {
+      const v = attr(n, 'data-app-shell-active-page');
+      if (v === 'false') return true;
+      if (v === 'true') return false;
+    }
+    return false;
+  };
+  const nearestTurnKey = (el) => { for (let n = el; n; n = n.parentElement) if (attr(n, 'data-turn-key')) return n; return null; };
+  function belongsToOtherConversation(cand, conversationId) {
+    if (!conversationId || conversationId === 'nueva') return false;
+    const root = cand.turnEl || cand.contentEl;
+    const ids = [];
+    const own = attr(root, 'data-chatgpt-selection-conversation-id');
+    if (own) ids.push(own);
+    try {
+      for (const tagged of $$('[data-chatgpt-selection-conversation-id]', root)) {
+        const turn = nearestTurnKey(tagged);
+        if (turn && root && attr(root, 'data-turn-key') && turn !== root) continue; // marca de un turno anidado ajeno
+        const id = attr(tagged, 'data-chatgpt-selection-conversation-id');
+        if (id) ids.push(id);
+      }
+    } catch (e) { /* sin marcas de conversación */ }
+    return ids.length > 0 && !ids.includes(conversationId);
+  }
+  function allCandidates(scope) {
+    hiddenDiscarded = 0;
+    const byEl = new Map();
+    for (const s of STRATEGIES) for (const cand of candidatesFor(s, scope)) if (!byEl.has(cand.contentEl)) byEl.set(cand.contentEl, cand);
+    let ordered = [...byEl.values()];
+    // Contenedor y contenido no son dos mensajes: si un candidato contiene a otro (p. ej. li de
+    // transcripción y su mensaje interno), se conserva el de la estrategia prioritaria.
+    const prio = new Map(STRATEGIES.map((s, i) => [s.name, i]));
+    ordered = ordered.filter((c) => !ordered.some((o) => o !== c && prio.get(o.strategy) < prio.get(c.strategy)
+      && (c.contentEl.contains(o.contentEl) || o.contentEl.contains(c.contentEl))));
+    ordered = ordered.filter((c) => { const v = isVisible(c.contentEl); if (!v) hiddenDiscarded++; return v; });
+    ordered = ordered.filter((c) => { const nav = inNavigation(c.contentEl); if (nav) hiddenDiscarded++; return !nav; }); // navegación/barras: no son mensajes
+    ordered = ordered.filter((c) => { const inactive = inInactivePage(c.contentEl); if (inactive) hiddenDiscarded++; return !inactive; }); // conversación anterior inactiva
+    const cidNow = currentConversationId();
+    ordered = ordered.filter((c) => { const other = belongsToOtherConversation(c, cidNow); if (other) hiddenDiscarded++; return !other; }); // marcas de otra conversación
+    try {
+      const order = new Map([scope, ...$$('*', scope)].map((e, i) => [e, i]));
+      ordered.sort((a, b) => (order.get(a.contentEl) ?? 1e9) - (order.get(b.contentEl) ?? 1e9));
+    } catch (e) { /* sin orden disponible: se conserva el orden de descubrimiento */ }
+    return ordered;
+  }
+
+  // ---- Fuente alternativa: JSON embebido en el código de la página ----
+  // La página puede traer la conversación en <script> JSON con el formato público de exportación:
+  // {mapping: {nodo: {parent, children, message:{id, author:{role}, content:{parts}, create_time}}}, current_node}.
+  // Se lee SOLO lo ya presente en la página (sin red, sin endpoints internos), solo si el script
+  // corresponde a la conversación de la URL, y solo cuando el DOM no entregó mensajes. Es una foto
+  // de la carga inicial: no refleja mensajes posteriores. Con caché para no re-parsear en cada escaneo.
+  let embeddedCache = { key: '', messages: [] };
+  function embeddedMessage(nodeMsg) {
+    if (!nodeMsg || !nodeMsg.author) return null;
+    const role = validRole(nodeMsg.author.role);
+    if (!role || nodeMsg.weight === 0 || (nodeMsg.metadata && nodeMsg.metadata.is_visually_hidden_from_conversation)) return null;
+    const content = nodeMsg.content || {};
+    let text = '', code = [];
+    if (content.content_type === 'code') { const c = content.text || (content.parts || []).filter((x) => typeof x === 'string').join('\n'); code = c ? [{ lang: content.language || '', code: c }] : []; text = c; }
+    else text = (content.parts || []).map((p) => typeof p === 'string' ? p : (p && typeof p.text === 'string' ? p.text : '')).filter(Boolean).join('\n');
+    if (!text && !code.length) return null;
+    return { id: 'msg:' + (nodeMsg.id || hash(text.slice(0, 160))), role, text, code, via: 'json-embebido', elemento: 'script JSON de la página',
+      timestamp: nodeMsg.create_time ? new Date(nodeMsg.create_time * 1000).toISOString() : null,
+      state: nodeMsg.status && nodeMsg.status.indexOf('in_progress') === 0 ? 'en-generacion' : 'finalizada' };
+  }
+  function branchMessages(conv) {
+    const mapping = conv.mapping || {}, ids = [];
+    if (conv.current_node && mapping[conv.current_node]) { // rama actual: desde current_node hacia la raíz
+      const seen = new Set();
+      for (let cur = conv.current_node; cur && mapping[cur] && !seen.has(cur); cur = mapping[cur].parent) { seen.add(cur); ids.unshift(cur); }
+    } else {
+      let rootId = Object.keys(mapping).find((k) => mapping[k] && mapping[k].parent == null);
+      const seen = new Set();
+      for (let cur = rootId; cur && mapping[cur] && !seen.has(cur);) { seen.add(cur); ids.push(cur); const ch = mapping[cur].children || []; cur = ch[ch.length - 1]; }
+    }
+    return ids.map((id) => embeddedMessage(mapping[id] && mapping[id].message)).filter(Boolean);
+  }
+  function collectConversations(rootObj, out) {
+    const seen = new Set(), stack = [rootObj];
+    let budget = 40000;
+    while (stack.length && budget-- > 0) {
+      const o = stack.pop();
+      if (!o || typeof o !== 'object' || seen.has(o)) continue;
+      seen.add(o);
+      if (o.mapping && typeof o.mapping === 'object' && (o.current_node || o.conversation_id || o.title !== undefined)) out.push(o);
+      for (const v of Object.values(o)) if (v && typeof v === 'object') stack.push(v);
+    }
+    return out;
+  }
+  function extractEmbedded(conversationId) {
+    // Un chat nuevo todavía no tiene ID verificable. La página puede conservar en su estado
+    // inicial datos de la conversación anterior: aceptarlos contaría mensajes de otro chat.
+    // En «nueva» la lectura es solo DOM hasta que ChatGPT asigne el ID real de la conversación.
+    if (!conversationId || conversationId === 'nueva') return [];
+    let scripts = [];
+    try { scripts = $$('script').filter((s) => (s.textContent || '').includes('"mapping"')); } catch (e) { return []; }
+    const key = conversationId + ':' + scripts.reduce((a, s) => a + (s.textContent || '').length, 0);
+    if (embeddedCache.key === key) return embeddedCache.messages;
+    let found = [];
+    for (const s of scripts) {
+      const raw = (s.textContent || '').trim();
+      if (conversationId !== 'nueva' && !raw.includes(conversationId)) continue; // debe ser de ESTA conversación
+      let data;
+      try { data = JSON.parse(raw); } catch (e) { continue; } // scripts JS (no JSON) se ignoran, sin inventar parseos
+      for (const conv of collectConversations(data, [])) {
+        if (conv.conversation_id && conversationId !== 'nueva' && conv.conversation_id !== conversationId) continue;
+        const msgs = branchMessages(conv);
+        if (msgs.length) { found = msgs; break; }
+      }
+      if (found.length) break;
+    }
+    embeddedCache = { key, messages: found };
+    return found;
+  }
+
+  function detect() {
+    // Ámbito: se prefiere <main>, pero si ahí no aparece NINGÚN elemento candidato y en el resto
+    // del documento sí, se busca en el documento completo (p. ej. si ChatGPT movió la conversación
+    // fuera del primer <main>). Quedarse solo con un <main> vacío fue un fallo real reportado:
+    // mensajes visibles en la página y todos los contadores en 0.
+    // Selección estratégica del ámbito: NO se elige por aciertos crudos de selectores.
+    // Se evalúan ámbitos en orden de confianza y se usa el primero que entregue mensajes
+    // utilizables (rol + contenido real) tras descartar ocultos, navegación, página inactiva y
+    // otras conversaciones. Así, al abrir un chat nuevo, una línea de tiempo anterior con
+    // aciertos pero sin mensajes válidos no puede fijar el conteo en 0 ni mezclar otro chat.
+    let scope = scopeRoot(), scopeName = scope === document ? 'documento' : 'main';
+    let activeRoot = null;
+    try { activeRoot = outer($$('[data-app-shell-active-page="true"]', document)).filter((e) => !inEvo(e))[0] || null; } catch (e) { /* sin marca de página activa */ }
+    const scopeOptions = [];
+    const addScope = (sc, name) => { if (sc && !scopeOptions.some((o) => o.scope === sc)) scopeOptions.push({ scope: sc, name }); };
+    try {
+      const timelines = $$('[data-app-action-timeline-scroll][role="region"], [data-app-action-timeline-scroll]', activeRoot || document);
+      for (const tl of timelines) addScope(tl, activeRoot ? 'timeline de la página activa' : 'timeline de la conversación');
+    } catch (e) { /* sin línea de tiempo */ }
+    if (activeRoot) addScope(activeRoot, 'página activa de la conversación');
+    const rootScope = scopeRoot(); addScope(rootScope, rootScope === document ? 'documento' : 'main');
+    addScope(document, 'documento (el <main> no contenía mensajes)');
+    const selectorCounts = {};
+    const conversationId = currentConversationId();
+    const fillSelectorCounts = () => { for (const s of STRATEGIES) { try { selectorCounts[s.name] = $$(s.sel, scope).length; } catch (e) { selectorCounts[s.name] = 0; } } };
+    let probes = {};
+    try { probes = { article: $$('article', document).length, conTestid: $$('[data-testid]', document).length, conRol: $$('[data-message-author-role], [data-conversation-role], [data-message-role]', document).length }; } catch (e) { /* sondeo no disponible */ }
+    let messages = [], chosenEls = [], duplicates = 0, unclassified = 0, skippedEmpty = 0, reconciliados = 0;
+    // Un ámbito solo sirve si entrega al menos un mensaje con rol Y contenido real extraíble:
+    // una línea de tiempo con candidatos clasificados pero vacíos o de pura interfaz (carga,
+    // botones) no debe fijar la lectura en 0 habiendo otro ámbito con la conversación visible.
+    const candidateHasContent = (cand) => {
+      try {
+        const nodes = contentElementsFor(cand.contentEl, cand.role);
+        const text = nodes.map((node) => visibleText(node)).filter(Boolean).join('\n');
+        if (text && !/^(copy|copiar|copy code|copiar código|edit|editar|good response|bad response|share|compartir)$/i.test(text)) return true;
+        return nodes.some((node) => extractCode(node).length);
+      } catch (e) { return false; }
+    };
+    let cands = [], scopeChosen = false, classifiedFallback = null, anyFallback = null;
+    for (const opt of scopeOptions) {
+      const optCands = allCandidates(opt.scope);
+      if (!anyFallback && optCands.length) anyFallback = { opt, optCands };
+      if (!classifiedFallback && optCands.some((c) => c.role)) classifiedFallback = { opt, optCands };
+      if (optCands.some((c) => c.role && candidateHasContent(c))) { scope = opt.scope; scopeName = opt.name; cands = optCands; scopeChosen = true; break; }
+    }
+    if (!scopeChosen) { // ningún ámbito entregó mensajes utilizables: se conserva la evidencia más confiable para el diagnóstico
+      const fb = classifiedFallback || anyFallback;
+      if (fb) { scope = fb.opt.scope; scopeName = fb.opt.name; cands = fb.optCands; }
+      else if (scopeOptions.length) { scope = scopeOptions[0].scope; scopeName = scopeOptions[0].name; cands = allCandidates(scope); }
+    }
+    fillSelectorCounts();
+    const turnRoleTotal = new Map(), turnRoleSeen = new Map();
+    for (const c of cands) { // cuántos mensajes del mismo rol comparten cada turno (para no fusionarlos)
+      if (!c.role) continue;
+      const k = c.turnEl;
+      if (!turnRoleTotal.has(k)) turnRoleTotal.set(k, { user: 0, assistant: 0 });
+      turnRoleTotal.get(k)[c.role]++;
+    }
+    const byId = new Map(), elsById = new Map(), roleCount = { user: 0, assistant: 0 }, fpNow = [], usedStrategies = new Set();
+    for (const cand of cands) {
+      if (!cand.role) { unclassified++; continue; }
+      const contentNodes = contentElementsFor(cand.contentEl, cand.role);
+      const text = contentNodes.map((node) => visibleText(node)).filter(Boolean).join('\n\n');
+      const code = contentNodes.flatMap((node) => extractCode(node));
+      if ((!text && !code.length) || /^(copy|copiar|copy code|copiar código|edit|editar|good response|bad response|share|compartir)$/i.test(text)) { skippedEmpty++; continue; } // carga, vacío o solo interfaz sin contenido real
+      const tKey = cand.turnEl;
+      if (!turnRoleSeen.has(tKey)) turnRoleSeen.set(tKey, { user: 0, assistant: 0 });
+      const ctx = { rolePos: roleCount[cand.role]++, turnRolePos: turnRoleSeen.get(tKey)[cand.role]++, turnRoleTotal: turnRoleTotal.get(tKey)[cand.role], reconciliados: 0 };
+      const id = stableId(cand.contentEl, cand.turnEl, cand.role, text, byId.size, ctx);
+      reconciliados += ctx.reconciliados;
+      usedStrategies.add(cand.strategy);
+      const timeEl = cand.contentEl.querySelector ? cand.contentEl.querySelector('time') : null;
+      // Cada mensaje queda asociado a SU conversación y con un uid único entre conversaciones:
+      // el mismo id local (turno/huella) en otro chat nunca se confunde con este.
+      const msg = { id, uid: conversationId + '::' + id, conversationId, role: cand.role, text, code, timestamp: attr(timeEl, 'datetime') || null, via: cand.strategy, elemento: describeEl(contentNodes[0] || cand.contentEl) };
+      if (id.startsWith('fp:')) fpNow.push({ id, role: cand.role, ph: hash(text.slice(0, 160)), rolePos: ctx.rolePos });
+      if (byId.has(id)) { // mismo mensaje repetido o actualizado: conserva el contenido más completo
+        duplicates++;
+        const prev = byId.get(id);
+        if (msg.text.length >= prev.text.length) { byId.set(id, msg); elsById.set(id, cand.contentEl); }
+      } else { byId.set(id, msg); elsById.set(id, cand.contentEl); }
+    }
+    // ---- Motor único de lectura: DOM (principal) + JSON embebido (complemento) ----
+    // Ambas fuentes alimentan EL MISMO registro. Coincidencia entre fuentes: mismo id real, o
+    // mismo rol + texto exacto cuando ese texto es único en ambas (textos repetidos ambiguos no
+    // se fusionan por texto). En coincidencias manda el DOM (visible y actual); el JSON aporta
+    // los mensajes que el DOM no tiene montados, en el orden de su rama. Sin ninguna coincidencia
+    // entre fuentes no se mezclan (podría ser otra rama): manda el DOM y se informa.
+    const domMessages = [...byId.values()];
+    chosenEls = [...elsById.values()];
+    if (domMessages.length) prevFingerprintRegistry = fpNow;
+    const domTotal = domMessages.length;
+    const embRaw = extractEmbedded(conversationId);
+    const jsonMessages = embRaw.map((m) => ({ ...m, uid: conversationId + '::' + m.id, conversationId, source: 'json' }));
+    const jsonTotal = jsonMessages.length;
+    let strategy = domMessages.length ? [...usedStrategies].join('+') : 'ninguna', fuente = 'dom';
+    let coincidentes = 0, jsonIgnorado = false;
+    const bare = (id) => (id && id.indexOf('msg:') === 0 ? id.slice(4) : null);
+    if (!domMessages.length && jsonMessages.length) {
+      fuente = 'json-embebido'; strategy = 'json-embebido-en-la-pagina';
+      messages = jsonMessages;
+    } else if (domMessages.length && jsonMessages.length) {
+      const matchOfDom = new Map(), usedJson = new Set(); // índice DOM -> índice JSON
+      domMessages.forEach((dm, di) => { // 1) por id real
+        const b = bare(dm.id); if (!b) return;
+        const ji = jsonMessages.findIndex((jm, j) => !usedJson.has(j) && bare(jm.id) === b);
+        if (ji >= 0) { matchOfDom.set(di, ji); usedJson.add(ji); }
+      });
+      const freq = (arr) => { const f = new Map(); for (const m of arr) { const k = m.role + '\n' + m.text; f.set(k, (f.get(k) || 0) + 1); } return f; };
+      const fD = freq(domMessages), fJ = freq(jsonMessages);
+      domMessages.forEach((dm, di) => { // 2) por rol + texto exacto único en ambas fuentes
+        if (matchOfDom.has(di)) return;
+        const k = dm.role + '\n' + dm.text;
+        if (fD.get(k) !== 1 || fJ.get(k) !== 1) return;
+        const ji = jsonMessages.findIndex((jm, j) => !usedJson.has(j) && jm.role + '\n' + jm.text === k);
+        if (ji >= 0) { matchOfDom.set(di, ji); usedJson.add(ji); }
+      });
+      coincidentes = matchOfDom.size;
+      if (!coincidentes) { jsonIgnorado = true; messages = domMessages.map((m) => ({ ...m, source: 'dom' })); }
+      else {
+        fuente = 'dom+json'; strategy = [...usedStrategies].join('+') + '+json-embebido';
+        const merged = jsonMessages.map((jm, ji) => { // orden de la rama JSON como base
+          const di = [...matchOfDom].find(([, j]) => j === ji);
+          if (!di) return jm; // solo JSON: el DOM no lo tiene montado
+          const dm = domMessages[di[0]];
+          return { ...jm, id: bare(jm.id) ? jm.id : dm.id, uid: conversationId + '::' + (bare(jm.id) ? jm.id : dm.id), text: dm.text, code: dm.code.length ? dm.code : jm.code, timestamp: dm.timestamp || jm.timestamp, state: dm.state || jm.state, source: 'dom+json' };
+        });
+        const mergedIndexOfDom = new Map(); // índice DOM -> posición en merged
+        matchOfDom.forEach((ji, di) => mergedIndexOfDom.set(di, ji));
+        domMessages.forEach((dm, di) => { // solo DOM: se inserta junto a sus vecinos del DOM
+          if (matchOfDom.has(di)) return;
+          const entry = { ...dm, source: 'dom' };
+          let pos = -1;
+          for (let k = di - 1; k >= 0; k--) if (mergedIndexOfDom.has(k)) { pos = mergedIndexOfDom.get(k) + 1; break; }
+          if (pos < 0) for (let k = di + 1; k < domMessages.length; k++) if (mergedIndexOfDom.has(k)) { pos = mergedIndexOfDom.get(k); break; }
+          if (pos < 0) pos = merged.length;
+          merged.splice(pos, 0, entry);
+          for (const [dIdx, mIdx] of mergedIndexOfDom) if (mIdx >= pos) mergedIndexOfDom.set(dIdx, mIdx + 1);
+          mergedIndexOfDom.set(di, pos);
+        });
+        messages = merged;
+      }
+    } else messages = domMessages.map((m) => ({ ...m, source: 'dom' }));
+    const jsonSolo = fuente === 'dom+json' ? jsonTotal - coincidentes : fuente === 'json-embebido' ? jsonTotal : 0;
+    // Garantía final del contador: el registro que ve el panel no puede contener dos veces
+    // el mismo uid, venga la repetición del DOM, del JSON o de la combinación de fuentes.
+    const seenUid = new Set();
+    messages = messages.filter((m) => { if (seenUid.has(m.uid)) { duplicates++; return false; } seenUid.add(m.uid); return true; });
+    for (const [id, el] of elsById) { // la identidad del elemento queda con el id canónico del registro único
+      const dm = domMessages.find((m) => m.id === id);
+      const reg = dm && messages.find((m) => m.text === dm.text && m.role === dm.role && (m.source === 'dom+json' || m.source === 'dom'));
+      elIdentity.set(el, reg ? reg.id : id);
+    }
+    lastContainer = domMessages.length ? commonContainer(chosenEls, scope) : null;
+    const chars = messages.reduce((a, m) => a + m.text.length, 0);
+    const tokens = EVO.estimateTokens ? messages.reduce((a, m) => a + EVO.estimateTokens(m.text), 0) : Math.ceil(chars / 4);
+    const reasons = [];
+    let status;
+    if (!messages.length) {
+      status = 'fallido';
+      reasons.push('No se encontró ningún mensaje con las estructuras conocidas ([data-message-author-role], article[data-turn], [data-testid^="conversation-turn-"], [data-turn-key], [data-content-search-unit-key], [data-user-message-bubble], [data-conversation-role], [data-chatgpt-agent-turn-start], [data-markdown-text-style="assistant-message"], transcripción li[data-message-role]). El DOM de esta página no es compatible con las variantes conocidas o todavía no cargó la conversación.');
+      reasons.push(document.querySelector('main') ? 'La página tiene <main> pero sin mensajes reconocibles: puede ser un chat vacío, la sesión no cargó la conversación o ChatGPT cambió su estructura. Abrí una conversación con mensajes y reintentá; si persiste, copiá el «Diagnóstico».'
+        : 'Ni siquiera se encontró el contenedor <main>: la conversación no terminó de cargar o no estás en una página de chat.');
+      reasons.push(`Sondeo en todo el documento: <article>=${probes.article ?? '?'}, elementos con data-testid=${probes.conTestid ?? '?'}, elementos con rol de mensaje=${probes.conRol ?? '?'}. Ámbito usado: ${scopeName}. Si el sondeo también da 0 con mensajes visibles, ChatGPT está usando una estructura no conocida: enviá la salida del botón «Diagnóstico» para ajustar el adaptador con datos reales.`);
+    } else {
+      const streaming = stopButtons().length > 0;
+      if (streaming) reasons.push('La IA está generando una respuesta: su texto puede seguir cambiando y se actualizará sin contarse como mensaje nuevo.');
+      if (messages[0].role === 'assistant') reasons.push('El primer mensaje cargado en el DOM es del asistente: es probable que falten mensajes anteriores todavía no cargados (historial virtualizado).');
+      if (unclassified) reasons.push(`${unclassified} elemento(s) sin rol reconocible fueron omitidos (no se les inventó un rol).`);
+      if (skippedEmpty) reasons.push(`${skippedEmpty} elemento(s) vacíos o de carga fueron omitidos.`);
+      if (!lastContainer) reasons.push('Se encontraron mensajes pero ningún ancestro común los contiene a todos: no se pudo fijar un contenedor de conversación observable (la estructura puede haber cambiado).');
+      if (hiddenDiscarded) reasons.push(`${hiddenDiscarded} elemento(s) ocultos (línea de tiempo de navegación o conversación anterior) fueron descartados.`);
+      if (fuente === 'json-embebido') reasons.push('El DOM no entregó mensajes reconocibles: estos mensajes se leyeron del JSON embebido en el código de la página (foto de la carga inicial). Pueden faltar mensajes posteriores y no hay contenedor observable hasta que el DOM los monte.');
+      if (fuente === 'dom+json') reasons.push(`Lectura combinada en un único registro: ${coincidentes} mensaje(s) coinciden en ambas fuentes (manda el DOM) y el JSON aportó ${jsonSolo} mensaje(s) que el DOM no tiene montados. El JSON es la foto de la carga inicial: puede no incluir mensajes posteriores a esa carga.`);
+      if (jsonIgnorado) reasons.push('Había JSON embebido de esta conversación pero ningún mensaje coincidió con el DOM (¿otra rama o datos desactualizados?): no se mezcló y se usó solo el DOM.');
+      status = reasons.length && (streaming || messages[0].role === 'assistant') ? 'parcial' : 'dom-completo';
+      if (status === 'dom-completo' && (unclassified || skippedEmpty || !lastContainer || fuente !== 'dom' || jsonIgnorado)) status = 'parcial';
+    }
+    const scrollEl = messages.length ? findScrollContainer() : null;
+    // Integridad del historial según SOLO la lectura actual: nunca 'complete' por ver mensajes.
+    // 'complete' lo declara únicamente la recuperación que alcanzó el inicio (content.js).
+    const integrity = !messages.length ? 'unverified' : status === 'parcial' ? 'partial' : 'unverified';
+    const integrityReason = !messages.length ? 'No se detectaron mensajes: no se puede comprobar el historial.'
+      : status === 'parcial' ? 'Se detectaron posibles faltantes en lo montado (ver motivos): el historial disponible está incompleto.'
+      : 'Hay mensajes visibles, pero eso no prueba que el historial esté completo: falta verificar el inicio (recuperación de antiguos).';
+    lastDetect = {
+      ok: messages.length > 0, status, historialIncompleto: status === 'parcial', integrity, integrityReason, strategy, messages,
+      total: messages.length,
+      user: messages.filter((m) => m.role === 'user').length,
+      assistant: messages.filter((m) => m.role === 'assistant').length,
+      withCode: messages.filter((m) => m.code.length).length,
+      chars, tokens, selectorCounts, duplicates, unclassified, skippedEmpty, reconciliados, ocultos: hiddenDiscarded, fuente,
+      domTotal, jsonTotal, jsonSolo, coincidentes, jsonIgnorado,
+      streaming: messages.length ? stopButtons().length > 0 : false,
+      containerFound: !!lastContainer, container: describeEl(lastContainer), scope: scopeName, probes,
+      scrollContainerFound: !!scrollEl, scrollContainer: describeScroll(scrollEl),
+      conversationId: (location.pathname.match(/\/c\/([\w-]+)/) || [])[1] || 'nueva',
+      reasons
+    };
+    return lastDetect;
+  }
+  const getMessages = () => detect().messages;
+
+  // Contenedor realmente desplazable de la conversación: se busca desde el contenedor de mensajes
+  // hacia arriba (la línea de tiempo tiene overflow). Si no se identifica, la recuperación de
+  // antiguos NO debe desplazar nada.
+  function findScrollContainer() {
+    const chain = [];
+    for (let n = lastContainer; n; n = n.parentElement) chain.push(n);
+    for (const n of chain) {
+      let overflow = '';
+      try { overflow = (getComputedStyle(n).overflowY || '') + (getComputedStyle(n).overflowX || ''); } catch (e) { /* sin estilos computados */ }
+      if (n.scrollHeight > n.clientHeight + 24 && (/auto|scroll/.test(overflow) || attr(n, 'data-app-action-timeline-scroll') !== null)) return n;
+    }
+    for (const n of chain) if (n.scrollHeight > n.clientHeight + 24) return n; // respaldo por dimensiones
+    try { return document.querySelector('[data-app-action-timeline-scroll]'); } catch (e) { return null; }
+  }
+  const describeScroll = (el) => el ? describeEl(el) : 'no identificado';
+
   const composer = () => { for (const [n, sel] of COMPOSERS) { const el = document.querySelector(sel); if (el) return { n, el }; } return null; };
   const stopButtons = () => $$('[data-testid="stop-button"], button[aria-label]').filter((b) => {
     const l = (b.getAttribute('aria-label') || '').trim();
     return b.matches('[data-testid="stop-button"]') || (STOP_RE.test(l) && !NOT_STOP.test(l));
   });
-
-  function getMessages() {
-    const st = pick();
-    if (!st) return [];
-    return st.els.map((el, i) => {
-      const role = st.s.role(el, i) === 'user' ? 'user' : 'assistant';
-      const text = el.innerText || '';
-      const id = el.getAttribute('data-message-id') || el.getAttribute('data-turn-id') || `${role}${i}-${hash(text.slice(0, 120))}`;
-      const code = $$('pre', el).map((pre) => {
-        const c = pre.querySelector('code');
-        const lang = ((c && c.className.match(/language-([\w+#-]+)/)) || [])[1] || '';
-        return { lang, code: (c || pre).innerText };
-      });
-      return { id, role, text, code };
-    });
-  }
 
   // Escribe en el cuadro de texto SIN enviar: el envío siempre lo hace la persona.
   function insertText(text) {
@@ -74,27 +638,35 @@
   }
 
   function diagnose() {
-    const st = pick(), c = composer(), msgs = getMessages();
+    const d = detect(), c = composer();
     const attrs = {}, testids = {};
-    for (const el of document.querySelectorAll('body *')) for (const a of el.attributes) {
-      if (!a.name.startsWith('data-')) continue;
-      attrs[a.name] = (attrs[a.name] || 0) + 1;
-      if (a.name === 'data-testid') { const k = a.value.replace(/\d+/g, 'N'); testids[k] = (testids[k] || 0) + 1; }
-    }
+    try {
+      for (const el of document.querySelectorAll('body *')) for (const a of el.attributes || []) {
+        if (!a.name.startsWith('data-')) continue;
+        attrs[a.name] = (attrs[a.name] || 0) + 1;
+        if (a.name === 'data-testid') { const k = a.value.replace(/\d+/g, 'N'); testids[k] = (testids[k] || 0) + 1; }
+      }
+    } catch (e) { /* diagnóstico parcial */ }
     const top = (o, n) => Object.entries(o).sort((x, y) => y[1] - x[1]).slice(0, n).map(([k, v]) => `${k}:${v}`);
     return {
       atributos_data: top(attrs, 15),
       testids: top(testids, 15),
       ruta: location.pathname.replace(/[\w-]{20,}/, '…'),
-      estrategia_mensajes: st ? st.s.name : 'NINGUNA',
-      mensajes: msgs.length,
-      usuario: msgs.filter((m) => m.role === 'user').length,
-      ia: msgs.filter((m) => m.role === 'assistant').length,
-      mensajes_con_codigo: msgs.filter((m) => m.code.length).length,
+      estrategia_mensajes: d.strategy,
+      estado_deteccion: d.status,
+      motivos: d.reasons,
+      mensajes: d.total, usuario: d.user, ia: d.assistant,
+      mensajes_con_codigo: d.withCode,
+      caracteres: d.chars, tokens_estimados: d.tokens,
+      duplicados_descartados: d.duplicates, sin_rol_omitidos: d.unclassified, vacios_omitidos: d.skippedEmpty,
+      reconciliados: d.reconciliados, contenedor_conversacion: d.container, cobertura: d.status, ambito_busqueda: d.scope, sondeo: d.probes, fuente: d.fuente, ocultos_descartados: d.ocultos || 0,
+      integridad_historial: d.integrity, motivo_integridad: d.integrityReason, contenedor_desplazable: d.scrollContainer,
+      mensajes_dom: d.domTotal, mensajes_json: d.jsonTotal, solo_json: d.jsonSolo, coincidentes: d.coincidentes, json_ignorado: d.jsonIgnorado,
+      mensajes_detalle: d.messages.map((m) => ({ rol: m.role, via: m.via || '', elemento: m.elemento || '', caracteres: m.text.length, inicio: m.text.slice(0, 90) })),
       cuadro_texto: c ? c.n : 'NO ENCONTRADO',
       transmitiendo: stopButtons().length > 0,
       botones_detener: stopButtons().map((b) => b.getAttribute('aria-label') || b.getAttribute('data-testid')),
-      candidatos: Object.fromEntries(STRATEGIES.map((s) => [s.name, $$(s.sel).length]))
+      candidatos: d.selectorCounts
     };
   }
 
@@ -102,7 +674,10 @@
     name: 'chatgpt',
     conversationId: () => (location.pathname.match(/\/c\/([\w-]+)/) || [])[1] || 'nueva',
     isStreaming: () => stopButtons().length > 0,
-    strategy: () => { const st = pick(); return st ? st.s.name : 'ninguna'; },
-    getMessages, insertText, diagnose
+    strategy: () => (lastDetect ? lastDetect.strategy : 'pendiente'),
+    lastDetect: () => lastDetect,
+    conversationContainer: () => lastContainer,
+    scrollContainer: () => findScrollContainer(),
+    getMessages, detect, insertText, diagnose
   };
 })(globalThis);

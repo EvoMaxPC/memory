@@ -19,7 +19,7 @@ Al abrir un chat antiguo, aprende del historial sin lanzar alertas; solo avisa d
 
 ## 2. Verificar la captura (sin consola)
 
-Abrí un chat con mensajes, pulsá **EVO → Diagnóstico**. Muestra (y copia al portapapeles) qué encontró:
+Abrí un chat con mensajes y mirá el conteo simple del panel: «Mensajes leídos» con cuántos son tuyos y cuántos de la IA. El diagnóstico técnico no se muestra en la interfaz. Solo si hace falta soporte, pulsá **EVO → Copiar datos técnicos** para copiarlo al portapapeles sin imprimirlo en el panel:
 `estrategia_mensajes` (debe ser distinta de NINGUNA), `mensajes`, `cuadro_texto` y `transmitiendo` (debe ser `false` si la IA no está respondiendo).
 Con esos datos se ajusta `adapters/chatgpt.js`, el único archivo que depende del sitio.
 
@@ -30,6 +30,12 @@ Con esos datos se ajusta `adapters/chatgpt.js`, el único archivo que depende de
 3. Marcá un código como fallido y pedí que lo repita: alerta de intento fallido.
 
 Pruebas automáticas de la lógica: `node tests/analyzers.test.js`.
+
+## Capa 1 — Motor de objetivo protegido (v0.2.0)
+
+En el panel, la sección **«Datos protegidos 🔒»** guarda por proyecto: objetivo principal completo, prohibiciones, instrucciones obligatorias y criterios de éxito. Solo el usuario puede cambiarlos, siempre con revisión «Antes/Después» y confirmación; cada cambio queda en un historial con fecha y versión. La IA recibe estos datos completos (nunca resumidos) al insertar el contexto, pero no puede modificarlos: si una respuesta contradice el objetivo o una prohibición, aparece la alerta «conflicto protegido» y los datos originales se conservan. Un criterio solo se marca cumplido con evidencia. Detalle completo en `INFORME-CAPA1.md`.
+
+Pruebas de la Capa 1: `node tests/capa1.test.js`.
 
 ## Límites conocidos
 

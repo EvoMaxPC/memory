@@ -3,7 +3,7 @@
   'use strict';
   const api = globalThis.browser ?? globalThis.chrome; // Firefox expone "browser"; Chromium, "chrome"
   const EVO = globalThis.EVO, A = EVO.adapter;
-  const VERSION = 'v0.1.1', KEY = 'evo_state_v1';
+  const VERSION = 'v0.2.0', KEY = 'evo_state_v1'; // debe coincidir con "version" de manifest.json
   const LIMIT = 60000; // tokens aproximados a partir de los cuales se sugiere traspasar a un chat nuevo
 
   const CONTRACT = [
@@ -19,10 +19,19 @@
     'No des nada por terminado si no figura en "verificado".'
   ].join('\n');
 
-  const newProject = (name) => ({ name, objective: '', nextStep: '', decisions: [], rules: [], failed: [], seen: {}, convs: {}, errFp: {}, code: [], alerts: [] });
-  let S, ctx = 0, lastSig = '', lastConv = '', timer, stable = 0, nMsgs = 0, scans = 0, lastError = '';
+  const store = EVO.ProjectStorage ? EVO.ProjectStorage.createStore(EVO.ProjectStorage.createExtensionBackend(api)) : null;
+  const newProject = (name) => EVO.ProjectStorage ? EVO.ProjectStorage.createProjectData(name)
+    : ({ name, objective: '', nextStep: '', decisions: [], rules: [], failed: [], seen: {}, convs: {}, errFp: {}, code: [], alerts: [] });
+  let S, ctx = 0, lastSig = '', lastConv = '', timer, stable = 0, nMsgs = 0, scans = 0, lastError = '', pendingChange = null;
+  let detectInfo = null, lastIngest = { nuevos: 0, antiguos: 0, actualizados: 0, manual: false };
+  // Motor en tiempo real: activo hasta que el usuario lo detiene (conserva el autoescaneo histórico).
+  let detectionActive = true, msgObserver = null, structObserver = null, obsContainer = null, obsConv = '';
+  let convState = 'esperando', lastUpdate = null, lastChangeAt = 0, procTimer = null, structTimer = null, safetyTimer = null;
+  let dupEvitados = 0, erroresLectura = 0, mutPendientes = 0, wasStreaming = false;
+  let recovering = false; const integrityByConv = {}; // integridad del historial por conversación
+  const waitMs = (ms) => new Promise((r) => setTimeout(r, ms));
   const P = () => S.projects[S.active];
-  const save = () => api.storage.local.set({ [KEY]: S });
+  const save = () => store ? store.saveState(S) : api.storage.local.set({ [KEY]: S });
   const addAlert = (kind, msg) => { const p = P(); p.alerts.unshift({ t: Date.now(), kind, msg }); p.alerts.length = Math.min(p.alerts.length, 40); };
 
   // ---------- Análisis de cada mensaje nuevo ----------
@@ -39,6 +48,8 @@
     const contract = EVO.parseContract(m.text);
     if (!contract) alert('contrato', 'La respuesta no trae el bloque [EVO]. Pedile que lo agregue (botón «Insertar contrato»).');
     if (EVO.prematureCompletion(m.text, contract)) alert('sin verificar', 'La IA da algo por terminado sin indicar qué verificó. Consideralo no verificado hasta tener evidencia (tests, ejecución).');
+    // Capa 1: la respuesta de la IA jamás modifica lo protegido; solo se señalan conflictos.
+    if (EVO.ObjectiveEngine) for (const c of EVO.ObjectiveEngine.detectConflicts(p, m.text)) alert('conflicto protegido', c.detail);
     const low = m.text.toLowerCase();
     for (const r of p.rules) if (r && low.includes(r.toLowerCase())) alert('regla', `La respuesta menciona «${r}», que marcaste como «no usar».`);
 
@@ -58,46 +69,237 @@
     }
   }
 
-  function scanInner() {
-    const msgs = A.getMessages();
-    nMsgs = msgs.length;
-    const sig = msgs.length + ':' + (msgs.length ? msgs[msgs.length - 1].text.length : 0);
-    if (sig !== lastSig) { lastSig = sig; stable = 0; return schedule(); } // esperar a que el texto deje de cambiar
-    if (A.isStreaming() && ++stable < 5) return schedule(); // si el botón «detener» queda pegado, no bloquea para siempre
+  // Firma del contenido COMPLETO (texto + código): detecta cambios aunque la longitud no varíe.
+  const contentHash = (s) => { let hsh = 0x811c9dc5; const t = String(s || ''); for (let i = 0; i < t.length; i++) { hsh ^= t.charCodeAt(i); hsh = Math.imul(hsh, 0x01000193); } return (hsh >>> 0).toString(36); };
+  // Procesa mensajes ya detectados SIN duplicar: `seen` guarda la firma completa de cada id estable.
+  // Un mensaje cuyo texto creció se actualiza como el mismo mensaje, no como uno nuevo.
+  // Análisis: el usuario se analiza al registrarse; el asistente SOLO cuando no hay streaming
+  // (nunca se analiza una respuesta incompleta como definitiva) y solo una vez por versión final:
+  // `analyzed` guarda la firma ya analizada, así la versión final conserva sus bloques de código
+  // sin generar alertas ni registros duplicados por cada fragmento intermedio.
+  function ingest(msgs, silent, streaming, cid) {
+    const p = P();
+    if (!p.analyzed || typeof p.analyzed !== 'object') p.analyzed = {};
+    // Clave de registro POR CONVERSACIÓN: el mismo id local en otro chat es otro registro.
+    const key = (m) => (m.uid || (cid + '::' + m.id));
+    // Foto previa de lo ya registrado en ESTA conversación: un mensaje no registrado que aparece
+    // ANTES de otros ya conocidos es un antiguo cargado posteriormente, no un mensaje nuevo.
+    const knownBefore = new Set(msgs.filter((m) => p.seen[key(m)] !== undefined || p.seen[m.id] !== undefined).map((m) => key(m)));
+    ctx = 0; let dirty = false; lastIngest = { nuevos: 0, antiguos: 0, actualizados: 0, manual: lastIngest.manual };
+    msgs.forEach((m, i) => {
+      ctx += EVO.estimateTokens(m.text);
+      const k = key(m), firma = m.text.length + ':' + contentHash(m.text) + ':' + m.code.map((b) => contentHash(b.code)).join(',');
+      if (p.seen[k] === undefined && p.seen[m.id] !== undefined) { p.seen[k] = p.seen[m.id]; dirty = true; } // registro de versiones anteriores, sin alcance
+      if (p.analyzed[k] === undefined && p.analyzed[m.id] !== undefined) p.analyzed[k] = p.analyzed[m.id];
+      if (!p.seen[k]) {
+        p.seen[k] = firma; dirty = true;
+        if (knownBefore.size && msgs.slice(i + 1).some((o) => knownBefore.has(key(o)))) lastIngest.antiguos++;
+        else lastIngest.nuevos++;
+      }
+      else if (p.seen[k] !== firma && p.seen[k] !== 1) { p.seen[k] = firma; dirty = true; lastIngest.actualizados++; }
+      else if (p.seen[k] === 1) { p.seen[k] = firma; dirty = true; } // formato viejo (solo presencia)
+      else dupEvitados++; // mismo id y mismo contenido: duplicado evitado, no se reprocesa
+      if (m.role === 'user') { if (!p.analyzed[k]) { p.analyzed[k] = firma; dirty = true; analyze(m, silent); } }
+      else if (!streaming && m.state !== 'en-generacion' && p.analyzed[k] !== firma) { p.analyzed[k] = firma; dirty = true; analyze(m, silent); }
+    });
+    return dirty;
+  }
+  // Al chat nuevo ChatGPT le asigna su id real después: los registros «nueva::*» pasan a ese id
+  // para que los mismos mensajes no se reprocesen como si fueran otros.
+  function migrateNewChatKeys(p, msgs, cid) {
+    for (const m of msgs) {
+      const oldK = 'nueva::' + m.id, newK = cid + '::' + m.id;
+      if (p.seen[oldK] !== undefined && p.seen[newK] === undefined) p.seen[newK] = p.seen[oldK];
+      if (p.analyzed && p.analyzed[oldK] !== undefined && p.analyzed[newK] === undefined) p.analyzed[newK] = p.analyzed[oldK];
+    }
+  }
+  function applyDetect(d, manual) {
     const p = P(), cid = A.conversationId();
-    if (lastConv === 'nueva' && cid !== 'nueva') p.convs[cid] = 1; // el chat nuevo recibió su id real
+    if (lastConv === 'nueva' && cid !== 'nueva') { p.convs[cid] = 1; migrateNewChatKeys(p, d.messages, cid); } // el chat nuevo recibió su id real
     lastConv = cid;
     const silent = !p.convs[cid]; // al abrir un chat antiguo se aprende del historial sin lanzar alertas
-    ctx = 0; let dirty = false;
-    for (const m of msgs) {
-      ctx += EVO.estimateTokens(m.text);
-      if (p.seen[m.id]) continue;
-      p.seen[m.id] = 1; dirty = true;
-      analyze(m, silent);
-    }
-    if (msgs.length && !p.convs[cid]) { p.convs[cid] = 1; dirty = true; }
+    detectInfo = d; nMsgs = d.total;
+    // Integridad: la lectura sola nunca declara 'complete'. Solo la sube a 'partial' si la propia
+    // detección sospecha faltantes; 'complete' únicamente tras una recuperación que llegó al inicio.
+    if (!integrityByConv[cid]) integrityByConv[cid] = { state: d.integrity || 'unverified', reason: d.integrityReason || 'No se pudo comprobar si el historial está completo.' };
+    else if (integrityByConv[cid].state === 'unverified' && d.integrity === 'partial') integrityByConv[cid] = { state: 'partial', reason: d.integrityReason };
+    lastIngest.manual = !!manual;
+    wasStreaming = !!(d.streaming || A.isStreaming());
+    let dirty = ingest(d.messages, silent, wasStreaming, cid);
+    if (d.messages.length && !p.convs[cid]) { p.convs[cid] = 1; dirty = true; }
     if (dirty) save();
+    lastSig = d.messages.length + ':' + (d.messages.length ? d.messages[d.messages.length - 1].text.length : 0);
+    lastUpdate = new Date();
+    convState = !d.total ? 'esperando' : (d.streaming || A.isStreaming()) ? 'procesando' : 'actualizada';
+    attachMessageObserver(); // si ChatGPT reemplazó el contenedor, se re-observa el nuevo
     render();
   }
-  function scan() {
-    scans++;
-    try { scanInner(); lastError = ''; } catch (e) { lastError = (e && e.message) || String(e); render(); }
+  function runDetect(manual) {
+    if (!A.detect) throw new Error('El adaptador no ofrece detección detallada (detect).');
+    return A.detect();
   }
-  const schedule = () => { clearTimeout(timer); timer = setTimeout(scan, 900); };
+  function scanInner() { applyDetect(runDetect(false), false); }
+  function scan() {
+    if (!detectionActive) return;
+    scans++;
+    try { scanInner(); lastError = ''; }
+    catch (e) { erroresLectura++; lastError = (e && e.message) || String(e); if (detectInfo) detectInfo.reasons = [...(detectInfo.reasons || []), 'Error de lectura: ' + lastError]; render(); }
+  }
+  // Mutaciones agrupadas (debounce): ni intervalos constantes ni un escaneo por mutación.
+  const schedule = () => { if (!detectionActive) return; clearTimeout(procTimer); procTimer = setTimeout(scan, 350); };
+  // Si dejó de llegar texto y no hay señal de generación, la respuesta queda "actualizada":
+  // es solo un indicio (ausencia de cambios + sin botón de detener), nunca una prueba absoluta.
+  const scheduleSettle = () => { clearTimeout(timer); timer = setTimeout(() => { if (detectionActive && !A.isStreaming() && detectInfo && detectInfo.total) scan(); }, 1600); }; // ese escaneo analiza por fin la versión completa (antes diferida)
+
+  // --- Observador de mensajes: solo el contenedor de la conversación (no toda la página) ---
+  function attachMessageObserver() {
+    if (!detectionActive) return;
+    const cont = A.conversationContainer ? A.conversationContainer() : null;
+    if (cont && cont === obsContainer && msgObserver) return;
+    if (msgObserver) { msgObserver.disconnect(); msgObserver = null; }
+    obsContainer = cont || null;
+    if (!cont) return;
+    msgObserver = new MutationObserver((muts) => {
+      if (!detectionActive) return;
+      // Ignorar mutaciones irrelevantes: las del propio panel EVO (vive fuera del contenedor y en shadow DOM)
+      const relevantes = muts.filter((mu) => !(mu.target && mu.target.closest && mu.target.closest('[data-evo-memory]')));
+      if (!relevantes.length) return;
+      mutPendientes += relevantes.length; lastChangeAt = Date.now();
+      if (convState !== 'procesando') convState = A.isStreaming() ? 'procesando' : convState;
+      schedule(); scheduleSettle();
+    });
+    msgObserver.observe(cont, { childList: true, subtree: true, characterData: true });
+  }
+  // Reconciliación de conversación/contenedor: la usan el observador de estructura y la
+  // verificación periódica de seguridad. Si ChatGPT cambia de chat reemplazando nodos, si
+  // la URL cambia sin una mutación útil o si el observador de mensajes quedó mirando un
+  // contenedor viejo, esta función re-descubre la conversación visible y re-escanea.
+  function reconcileConversation() {
+    if (!detectionActive) return;
+    const cid = A.conversationId();
+    const contOk = obsContainer && document.contains(obsContainer);
+    if (cid !== obsConv) { // cambio de conversación: separar registros y re-observar, sin borrar nada
+      obsConv = cid; obsContainer = null;
+      if (msgObserver) { msgObserver.disconnect(); msgObserver = null; }
+      lastSig = ''; convState = 'esperando';
+      say('Conversación cambiada: se leen solo los mensajes de esta conversación; los anteriores se conservan.');
+      scan();
+    } else if (!contOk) { obsContainer = null; scan(); } // contenedor reconstruido, chat nuevo o mensajes recién cargados
+    else if (A.isStreaming() !== wasStreaming) schedule(); // apareció/desapareció la señal de generación: reevaluar y, si terminó, analizar la versión final
+  }
+  // Verificación de seguridad de baja frecuencia: no reemplaza a los observadores; evita que
+  // una conversación nueva quede sin leer si una mutación no llegó o el contenedor cambió.
+  function ensureSafetyTimer() {
+    if (safetyTimer) return;
+    safetyTimer = setInterval(reconcileConversation, 2500);
+    if (safetyTimer && typeof safetyTimer.unref === 'function') safetyTimer.unref(); // en Node no debe retener el proceso de pruebas
+  }
+  // --- Observador de estructura: contenedor reemplazado, navegación SPA y cambios de URL ---
+  function attachStructureObserver() {
+    if (structObserver || !(document.documentElement || document.body)) return;
+    structObserver = new MutationObserver(() => {
+      if (!detectionActive) return;
+      clearTimeout(structTimer);
+      structTimer = setTimeout(reconcileConversation, 500); // chequeo agrupado, sin reescanear por cada mutación
+    });
+    // Se observa la raíz del documento, no solo <body>: si ChatGPT reemplaza el body o mueve
+    // la conversación fuera del contenedor anterior, el ciclo de descubrimiento sigue vivo.
+    structObserver.observe(document.documentElement || document.body, { childList: true, subtree: true });
+  }
+  function startDetection(manual) {
+    detectionActive = true;
+    obsConv = A.conversationId();
+    attachStructureObserver();
+    ensureSafetyTimer();
+    lastIngest = { nuevos: 0, antiguos: 0, actualizados: 0, manual: !!manual };
+    try {
+      const d = runDetect(!!manual); // escaneo inmediato y completo de lo disponible en el DOM
+      applyDetect(d, !!manual);
+      say(d.status === 'fallido' ? 'Lectura activa: todavía no hay mensajes legibles en esta conversación.'
+        : `Lectura activa: ${d.total} mensajes únicos (${lastIngest.nuevos} nuevos, ${lastIngest.actualizados} actualizados).`);
+    } catch (e) {
+      erroresLectura++;
+      detectInfo = { status: 'fallido', strategy: 'ninguna', total: 0, user: 0, assistant: 0, withCode: 0, chars: 0, tokens: 0, selectorCounts: {}, duplicates: 0, skippedEmpty: 0, unclassified: 0, reconciliados: 0, containerFound: false, container: 'no encontrado', streaming: false, conversationId: A.conversationId(), reasons: ['Error al analizar el DOM: ' + ((e && e.message) || String(e))] };
+      nMsgs = 0; render();
+      say('No se pudo iniciar la lectura de mensajes en esta página.');
+    }
+  }
+  function stopDetection() {
+    detectionActive = false; obsContainer = null;
+    if (msgObserver) { msgObserver.disconnect(); msgObserver = null; }
+    if (structObserver) { structObserver.disconnect(); structObserver = null; }
+    if (safetyTimer) { clearInterval(safetyTimer); safetyTimer = null; }
+    clearTimeout(procTimer); clearTimeout(timer); clearTimeout(structTimer);
+    render(); // los registros y contadores existentes se conservan
+    say('Lectura detenida: no se observan nuevos cambios. Los mensajes ya leídos se conservan.');
+  }
+  // Recuperación de mensajes antiguos: recorre el contenedor real hacia arriba de a pasos,
+  // incorpora lo que ChatGPT monte tras cada desplazamiento (mismo registro, por uid, sin
+  // duplicados y en el orden que devuelve la lectura) y restaura EXACTAMENTE el scrollTop
+  // original al terminar. Se detiene al llegar al inicio (2 comprobaciones sin novedades),
+  // tras 3 intentos sin mensajes nuevos, por cambio de conversación/contenedor o ante un error.
+  // Sin contenedor desplazable identificado no desplaza nada.
+  async function recoverHistory() {
+    if (recovering) return say('La recuperación ya está en curso.');
+    if (!detectionActive) return say('Primero iniciá la detección para recuperar mensajes antiguos.');
+    if (A.isStreaming()) return say('La IA está generando: esperá a que termine para recuperar antiguos.');
+    const cid = A.conversationId();
+    scan();
+    const cont0 = A.scrollContainer ? A.scrollContainer() : null;
+    if (!cont0) {
+      integrityByConv[cid] = { state: 'unverified', reason: 'No se identificó el contenedor desplazable de la conversación: no se ejecutó ningún desplazamiento.' };
+      render();
+      return say('No se movió la conversación: desde esta vista no se pudieron recuperar mensajes antiguos.');
+    }
+    recovering = true;
+    if (refs.recBtn) { refs.recBtn.disabled = true; refs.recBtn.textContent = 'Recuperando…'; }
+    const originalTop = cont0.scrollTop;
+    const known = new Set((detectInfo ? detectInfo.messages : []).map((m) => m.uid));
+    let incorporados = 0, sinNuevos = 0, pasos = 0, motivoFin = '';
+    say('Recuperando mensajes antiguos… (no toques la conversación hasta que termine)');
+    try {
+      while (pasos < 80) {
+        pasos++;
+        if (A.conversationId() !== cid) { integrityByConv[cid] = { state: 'partial', reason: 'La recuperación se interrumpió por un cambio de conversación.' }; motivoFin = 'cambio de conversación'; break; }
+        const cont = A.scrollContainer ? A.scrollContainer() : null;
+        if (!cont || cont !== cont0 || !document.contains(cont0)) { integrityByConv[cid] = { state: 'partial', reason: 'El contenedor de la conversación fue reemplazado durante la recuperación.' }; motivoFin = 'contenedor reemplazado'; break; }
+        const antes = cont.scrollTop, paso = Math.max(240, Math.floor((cont.clientHeight || 600) * 0.85));
+        cont.scrollTop = Math.max(0, cont.scrollTop - paso);
+        await waitMs(650); // tiempo para que ChatGPT monte los antiguos; el observador y este escaneo los incorporan
+        scan();
+        const ahora = A.lastDetect ? A.lastDetect() : detectInfo;
+        const nuevos = (ahora ? ahora.messages : []).filter((m) => !known.has(m.uid));
+        nuevos.forEach((m) => known.add(m.uid));
+        incorporados += nuevos.length;
+        sinNuevos = nuevos.length ? 0 : sinNuevos + 1;
+        if (cont.scrollTop <= 0) {
+          if (sinNuevos >= 2) { integrityByConv[cid] = { state: 'complete', reason: `Se alcanzó el inicio del historial (parte superior del contenedor) y no aparecieron mensajes nuevos en 2 comprobaciones seguidas. Antiguos incorporados en esta recuperación: ${incorporados}.` }; motivoFin = 'inicio alcanzado'; break; }
+        } else if (sinNuevos >= 3) { integrityByConv[cid] = { state: 'partial', reason: `Sin mensajes nuevos después de 3 intentos sin llegar al inicio. Antiguos incorporados: ${incorporados}.` }; motivoFin = 'sin mensajes nuevos'; break; }
+        if (cont.scrollTop === antes && cont.scrollTop > 0) { integrityByConv[cid] = { state: 'partial', reason: 'El contenedor no se desplazó (no respondió al desplazamiento).' }; motivoFin = 'sin desplazamiento'; break; }
+        render();
+      }
+      if (!motivoFin) integrityByConv[cid] = { state: 'partial', reason: `Recuperación detenida por el límite de ${pasos} pasos. Antiguos incorporados: ${incorporados}.` };
+    } catch (e) {
+      erroresLectura++;
+      integrityByConv[cid] = { state: incorporados ? 'partial' : 'unverified', reason: 'Error durante la recuperación: ' + ((e && e.message) || String(e)) };
+      motivoFin = 'error';
+    } finally {
+      try { const cont = (A.scrollContainer && A.scrollContainer()) || cont0; if (cont && document.contains(cont)) cont.scrollTop = originalTop; } catch (e) { /* restaurar es best-effort si el DOM cambió */ }
+      recovering = false;
+      if (refs.recBtn) { refs.recBtn.disabled = false; refs.recBtn.textContent = 'Recuperar mensajes antiguos'; }
+      render();
+    }
+    const historialCompleto = integrityByConv[cid] && integrityByConv[cid].state === 'complete';
+    say(historialCompleto
+      ? `Recuperación terminada: ${incorporados} mensajes antiguos incorporados. Se llegó al comienzo de la conversación y tu posición fue restaurada.`
+      : `Recuperación terminada: ${incorporados} mensajes antiguos incorporados. Tu posición fue restaurada.`);
+  }
+  const manualDetect = () => startDetection(true);
 
   // ---------- Contexto que se entrega a la IA ----------
-  const contextText = () => {
-    const p = P(), ul = (a) => a.map((x) => '- ' + x).join('\n');
-    return [
-      'CONTEXTO DEL PROYECTO (EVO) — información confirmada por el usuario; no la contradigas sin avisar.',
-      `Proyecto: ${p.name}`,
-      p.objective && `Objetivo: ${p.objective}`,
-      p.decisions.length && `Decisiones confirmadas (textuales):\n${ul(p.decisions)}`,
-      p.rules.length && `No usar / evitar:\n${ul(p.rules)}`,
-      p.failed.length && `Intentos que YA fallaron (no repetir):\n${ul(p.failed.map((f) => f.note))}`,
-      p.nextStep && `Próximo paso: ${p.nextStep}`
-    ].filter(Boolean).join('\n\n');
-  };
+  // Contexto protegido completo (sin resumir el objetivo) construido por context/context-builder.js.
+  const contextText = () => EVO.ContextBuilder ? EVO.ContextBuilder.buildProtectedContext(P())
+    : `Proyecto: ${P().name}\nObjetivo: ${P().protectedData ? P().protectedData.objective.value : P().objective || ''}`;
 
   // ---------- Interfaz ----------
   const h = (tag, props = {}, ...kids) => {
@@ -131,12 +333,60 @@
     .bar i{display:block;height:100%;border-radius:3px;background:var(--ac)}
     .bar.w i{background:var(--wn)}.bar.b i{background:#d1344a}
     .a{padding:6px 8px;margin:4px 0;border-left:3px solid var(--wn);background:rgba(154,91,0,.08);border-radius:0 6px 6px 0}
-    .d{white-space:pre-wrap;font:11px/1.3 monospace;margin:8px 0 0;color:var(--mu)}
-    .acts{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}`;
+    .acts{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}` + (EVO.ObjectivePanel ? EVO.ObjectivePanel.STYLES : '');
 
   const refs = {};
   const say = (m) => { refs.status.textContent = m; setTimeout(() => { if (refs.status.textContent === m) refs.status.textContent = ''; }, 4000); };
-  const insert = (t) => say(A.insertText(t) ? 'Texto insertado. Revisalo y enviá vos.' : 'No encontré el cuadro de texto: revisá el selector del adaptador.');
+  const insert = (t) => say(A.insertText(t) ? 'Texto insertado. Revisalo y enviá vos.' : 'No encontré el cuadro para escribir el texto.');
+
+  // ---------- Cambios protegidos: revisión → confirmación → guardado con historial ----------
+  function showPending() {
+    if (!pendingChange) { refs.pConfirm.replaceChildren(); return; }
+    const d = EVO.ObjectiveEngine.describeChange(P(), pendingChange);
+    refs.pConfirm.replaceChildren(h('div', { className: 'cf' },
+      h('b', { textContent: pendingChange.field === 'objective' ? 'Ya existe un OBJETIVO PROTEGIDO. Confirmá solo si querés reemplazarlo:' : 'Revisá el cambio antes de guardarlo' }),
+      h('div', { className: 'm', textContent: d.label }),
+      h('div', { className: 'm', textContent: 'Antes: ' + d.before }),
+      h('div', { className: 'm', textContent: 'Después: ' + d.after }),
+      h('div', { className: 'row' },
+        h('button', { textContent: 'Confirmar guardado', onclick: confirmPending }),
+        h('button', { textContent: 'Cancelar', onclick: () => { pendingChange = null; showPending(); say('Cambio cancelado: no se guardó nada.'); } }))));
+  }
+  function requestChange(change) {
+    const v = EVO.ObjectiveEngine.validateChange(P(), change);
+    if (!v.ok) return say(v.errors.join(' '));
+    pendingChange = change; showPending();
+    say('Cambio en revisión: no se guardó nada todavía.');
+  }
+  // Botón «Guardar y proteger objetivo»: sin objetivo previo guarda directo (clic explícito del
+  // usuario); si ya existe uno, exige confirmación con Antes/Después y cancelar lo conserva.
+  function requestObjective(value) {
+    const change = { field: 'objective', action: 'set', value: value || '' };
+    const v = EVO.ObjectiveEngine.validateChange(P(), change);
+    if (!v.ok) return say(v.errors.join(' '));
+    const current = P().protectedData && P().protectedData.objective ? P().protectedData.objective.value : '';
+    if (!current) { pendingChange = change; confirmPending(); return; } // primer guardado
+    if (current === change.value) return say('Ese texto ya es el OBJETIVO PROTEGIDO guardado: no hubo cambios.');
+    requestChange(change); // modificación: queda en revisión hasta confirmar; cancelar conserva el anterior
+  }
+  function requestCriterion(item) {
+    const ev = prompt('Evidencia concreta de que el criterio se cumplió (ej.: comando ejecutado y resultado):');
+    if (!ev || !ev.trim()) return say('Sin evidencia no se puede marcar cumplido: no se solicitó ningún cambio.');
+    requestChange({ field: 'successCriteria', action: 'setStatus', itemId: item.id, status: 'achieved', evidence: ev.trim() });
+  }
+  async function confirmPending() {
+    if (!pendingChange) return;
+    const change = pendingChange; pendingChange = null; showPending();
+    // Único camino de guardado protegido: actor 'user' + confirmación, validado por el motor.
+    const r = store ? await store.applyProtectedChange(S, S.active, change, { actor: 'user', confirmed: true })
+      : EVO.ObjectiveEngine.applyProtectedChange(P(), change, { actor: 'user', confirmed: true });
+    if (!r.ok) return say('No se guardó: ' + r.error);
+    if (!store) { S.projects[S.active] = r.project; await save(); }
+    if (refs.pObj) delete refs.pObj.dataset.editing;
+    fill(); render();
+    say(change.field === 'objective' ? `OBJETIVO PROTEGIDO guardado (versión ${r.entry.version}). Quedó registrado en el historial.` : `Cambio protegido guardado (versión ${r.entry.version}). Quedó registrado en el historial.`);
+  }
+  const panelActions = { requestChange, requestCriterion, requestObjective };
   const list = (el, items, del) => el.replaceChildren(...items.map((t, i) => h('li', {}, h('span', { textContent: t }), h('button', { textContent: '×', title: 'Quitar', onclick: () => { del(i); save(); render(); } }))));
 
   function markFailed() {
@@ -148,20 +398,23 @@
     save(); render();
   }
   function showDiag() {
+    // El diagnóstico es información técnica de soporte: se copia solo si el usuario lo pide.
+    // Nunca se vuelca como texto dentro del panel.
     const d = JSON.stringify(A.diagnose(), null, 1);
-    refs.diag.textContent = d;
-    navigator.clipboard.writeText(d).then(() => say('Diagnóstico copiado al portapapeles.'), () => say('Diagnóstico a la vista (no se pudo copiar).'));
+    navigator.clipboard.writeText(d).then(() => say('Datos técnicos copiados al portapapeles.'), () => say('No se pudieron copiar los datos técnicos.'));
   }
-  function newProj() {
+  async function newProj() {
     const name = prompt('Nombre del proyecto');
     if (!name) return;
-    const id = 'p' + Date.now();
-    S.projects[id] = newProject(name); S.active = id; save(); fill(); render();
+    if (store) await store.createProject(S, name);
+    else { const id = 'p' + Date.now(); S.projects[id] = newProject(name); S.active = id; await save(); }
+    pendingChange = null; fill(); render();
   }
-  const fill = () => { refs.obj.value = P().objective; refs.next.value = P().nextStep; };
+  const fill = () => { refs.next.value = P().nextStep; if (refs.pObj) { delete refs.pObj.dataset.editing; refs.pObj.value = P().protectedData ? P().protectedData.objective.value : ''; } };
 
   function build() {
-    const host = h('div'), root = host.attachShadow({ mode: 'open' });
+    const host = h('div'); host.setAttribute('data-evo-memory', 'panel'); // el adaptador excluye este nodo de la detección
+    const root = host.attachShadow({ mode: 'open' });
     const adder = (ph, fn) => {
       const i = h('input', { placeholder: ph });
       const add = () => { const v = i.value.trim(); if (v) { fn(v); i.value = ''; save(); render(); } };
@@ -170,16 +423,20 @@
     };
     Object.assign(refs, {
       status: h('div', { className: 'm' }), live: h('div', { className: 'm' }), meter: h('div', { className: 'm' }), bar: h('div', { className: 'bar' }, h('i')),
-      alerts: h('div'), diag: h('pre', { className: 'd' }), dec: h('ul'), rul: h('ul'), fail: h('ul'),
-      proj: h('select', { onchange: () => { S.active = refs.proj.value; save(); fill(); render(); } }),
-      obj: h('textarea', { rows: 2, placeholder: 'Qué se quiere lograr', onchange: () => { P().objective = refs.obj.value; save(); } }),
+      detState: h('div', { className: 'm' }),
+      recBtn: h('button', { textContent: 'Recuperar mensajes antiguos', onclick: () => recoverHistory() }),
+      alerts: h('div'), dec: h('ul'), rul: h('ul'), fail: h('ul'),
+      proj: h('select', { onchange: () => { S.active = refs.proj.value; pendingChange = null; save(); fill(); render(); } }),
       next: h('textarea', { rows: 2, placeholder: 'Qué sigue, en una frase', onchange: () => { P().nextStep = refs.next.value; save(); } })
     });
     const panel = h('div', { className: 'p' },
       h('div', { className: 'row' }, h('b', { textContent: 'EVO Memory ' + VERSION }), refs.proj, h('button', { textContent: 'Nuevo', onclick: newProj })),
       refs.bar, refs.meter, refs.live, refs.status,
+      h('div', { className: 'row' }, h('button', { textContent: 'Iniciar detección', onclick: () => startDetection(true) }), h('button', { textContent: 'Detener detección', onclick: stopDetection })),
+      refs.detState,
+      h('div', { className: 'row' }, refs.recBtn, h('span', { className: 'm', textContent: 'Recorre hacia arriba, incorpora antiguos y restaura tu posición' })),
+      EVO.ObjectivePanel ? EVO.ObjectivePanel.build(h, refs, panelActions) : h('div', { className: 'm', textContent: '⚠ Módulo de datos protegidos no cargado.' }),
       h('h4', { textContent: 'Alertas' }), refs.alerts,
-      h('h4', { textContent: 'Objetivo' }), refs.obj,
       h('h4', { textContent: 'Decisiones confirmadas' }), refs.dec, adder('Decisión (se copia tal cual)', (v) => P().decisions.push(v)),
       h('h4', { textContent: 'No usar' }), refs.rul, adder('Término a evitar', (v) => P().rules.push(v)),
       h('h4', { textContent: 'Intentos fallidos' }), refs.fail,
@@ -190,8 +447,7 @@
         h('button', { textContent: 'Marcar último código como fallido', onclick: markFailed }),
         h('button', { textContent: 'Copiar traspaso', onclick: () => navigator.clipboard.writeText(contextText() + '\n\n' + CONTRACT).then(() => say('Traspaso copiado.')) }),
         h('button', { textContent: 'Borrar alertas', onclick: () => { P().alerts = []; save(); render(); } }),
-        h('button', { textContent: 'Diagnóstico', onclick: showDiag })),
-      refs.diag);
+        h('button', { textContent: 'Copiar datos técnicos', onclick: showDiag })));
     root.append(h('style', { textContent: CSS }), h('button', { className: 't', textContent: 'EVO', onclick: () => panel.classList.toggle('open') }), panel);
     document.body.append(host);
   }
@@ -199,10 +455,19 @@
   function render() {
     const p = P(), pct = Math.min(100, Math.round((ctx / LIMIT) * 100));
     refs.proj.replaceChildren(...Object.entries(S.projects).map(([id, v]) => h('option', { value: id, textContent: v.name, selected: id === S.active })));
-    refs.live.textContent = `Detectados: ${nMsgs} mensajes (estrategia: ${A.strategy()}) · escaneos: ${scans}` + (lastError ? ` · ERROR: ${lastError}` : '');
+    // Vista normal del usuario: solo cantidades y estado simple. El detalle técnico
+    // (selectores, contenedor, motivos, errores e integridad) queda dentro de
+    // A.diagnose() y se copia únicamente con «Copiar datos técnicos»; no se muestra acá.
+    refs.live.textContent = detectInfo
+      ? `Mensajes leídos: ${nMsgs} (${detectInfo.user} tuyos · ${detectInfo.assistant} de la IA)`
+      : `Mensajes leídos: ${nMsgs}`;
+    if (refs.detState) refs.detState.textContent = detectionActive
+      ? `● Lectura activa · ${convState === 'procesando' ? 'la IA está respondiendo' : convState === 'actualizada' ? 'conversación actualizada' : 'esperando mensajes'}${lastUpdate ? ' · ' + lastUpdate.toLocaleTimeString() : ''}`
+      : '○ Lectura detenida · los mensajes ya leídos se conservan';
     refs.bar.className = 'bar' + (pct >= 90 ? ' b' : pct >= 70 ? ' w' : '');
     refs.bar.firstChild.style.width = pct + '%';
     refs.meter.textContent = `Contexto de esta conversación: ~${ctx.toLocaleString()} tokens (estimación)` + (pct >= 70 ? '. Conviene traspasar a un chat nuevo.' : '');
+    if (refs.pObjView && EVO.ObjectivePanel) EVO.ObjectivePanel.render(h, refs, p, panelActions);
     list(refs.dec, p.decisions, (i) => p.decisions.splice(i, 1));
     list(refs.rul, p.rules, (i) => p.rules.splice(i, 1));
     list(refs.fail, p.failed.map((f) => f.note), (i) => p.failed.splice(i, 1));
@@ -210,9 +475,9 @@
   }
 
   (async () => {
-    const r = await api.storage.local.get(KEY);
-    S = r[KEY] || { active: 'default', projects: { default: newProject('Proyecto 1') } };
-    build(); fill(); scan();
-    new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true, characterData: true });
+    if (store) { S = await store.loadState(); await save(); } // loadState migra proyectos v0.1 sin perder datos
+    else { const r = await api.storage.local.get(KEY); S = r[KEY] || { active: 'default', projects: { default: newProject('Proyecto 1') } }; }
+    build(); fill();
+    startDetection(false); // detección activa desde la carga (comportamiento histórico) hasta que el usuario la detenga
   })();
 })();
