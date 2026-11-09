@@ -31,6 +31,12 @@ Con esos datos se ajusta `adapters/chatgpt.js`, el único archivo que depende de
 
 Pruebas automáticas de la lógica: `node tests/analyzers.test.js`.
 
+## Capa 1 — Motor de objetivo protegido (v0.2.0)
+
+En el panel, la sección **«Datos protegidos 🔒»** guarda por proyecto: objetivo principal completo, prohibiciones, instrucciones obligatorias y criterios de éxito. Solo el usuario puede cambiarlos, siempre con revisión «Antes/Después» y confirmación; cada cambio queda en un historial con fecha y versión. La IA recibe estos datos completos (nunca resumidos) al insertar el contexto, pero no puede modificarlos: si una respuesta contradice el objetivo o una prohibición, aparece la alerta «conflicto protegido» y los datos originales se conservan. Un criterio solo se marca cumplido con evidencia. Detalle completo en `INFORME-CAPA1.md`.
+
+Pruebas de la Capa 1: `node tests/capa1.test.js`.
+
 ## Límites conocidos
 
 - Las alertas son **heurísticas**: pueden fallar o dar falsos avisos. La regresión solo se detecta si la versión nueva se parece bastante (>50 %) a una anterior; con fragmentos sueltos no avisa.

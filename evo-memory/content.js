@@ -19,10 +19,12 @@
     'No des nada por terminado si no figura en "verificado".'
   ].join('\n');
 
-  const newProject = (name) => ({ name, objective: '', nextStep: '', decisions: [], rules: [], failed: [], seen: {}, convs: {}, errFp: {}, code: [], alerts: [] });
-  let S, ctx = 0, lastSig = '', lastConv = '', timer, stable = 0, nMsgs = 0, scans = 0, lastError = '';
+  const store = EVO.ProjectStorage ? EVO.ProjectStorage.createStore(EVO.ProjectStorage.createExtensionBackend(api)) : null;
+  const newProject = (name) => EVO.ProjectStorage ? EVO.ProjectStorage.createProjectData(name)
+    : ({ name, objective: '', nextStep: '', decisions: [], rules: [], failed: [], seen: {}, convs: {}, errFp: {}, code: [], alerts: [] });
+  let S, ctx = 0, lastSig = '', lastConv = '', timer, stable = 0, nMsgs = 0, scans = 0, lastError = '', pendingChange = null;
   const P = () => S.projects[S.active];
-  const save = () => api.storage.local.set({ [KEY]: S });
+  const save = () => store ? store.saveState(S) : api.storage.local.set({ [KEY]: S });
   const addAlert = (kind, msg) => { const p = P(); p.alerts.unshift({ t: Date.now(), kind, msg }); p.alerts.length = Math.min(p.alerts.length, 40); };
 
   // ---------- Análisis de cada mensaje nuevo ----------
@@ -39,6 +41,8 @@
     const contract = EVO.parseContract(m.text);
     if (!contract) alert('contrato', 'La respuesta no trae el bloque [EVO]. Pedile que lo agregue (botón «Insertar contrato»).');
     if (EVO.prematureCompletion(m.text, contract)) alert('sin verificar', 'La IA da algo por terminado sin indicar qué verificó. Consideralo no verificado hasta tener evidencia (tests, ejecución).');
+    // Capa 1: la respuesta de la IA jamás modifica lo protegido; solo se señalan conflictos.
+    if (EVO.ObjectiveEngine) for (const c of EVO.ObjectiveEngine.detectConflicts(p, m.text)) alert('conflicto protegido', c.detail);
     const low = m.text.toLowerCase();
     for (const r of p.rules) if (r && low.includes(r.toLowerCase())) alert('regla', `La respuesta menciona «${r}», que marcaste como «no usar».`);
 
@@ -86,18 +90,9 @@
   const schedule = () => { clearTimeout(timer); timer = setTimeout(scan, 900); };
 
   // ---------- Contexto que se entrega a la IA ----------
-  const contextText = () => {
-    const p = P(), ul = (a) => a.map((x) => '- ' + x).join('\n');
-    return [
-      'CONTEXTO DEL PROYECTO (EVO) — información confirmada por el usuario; no la contradigas sin avisar.',
-      `Proyecto: ${p.name}`,
-      p.objective && `Objetivo: ${p.objective}`,
-      p.decisions.length && `Decisiones confirmadas (textuales):\n${ul(p.decisions)}`,
-      p.rules.length && `No usar / evitar:\n${ul(p.rules)}`,
-      p.failed.length && `Intentos que YA fallaron (no repetir):\n${ul(p.failed.map((f) => f.note))}`,
-      p.nextStep && `Próximo paso: ${p.nextStep}`
-    ].filter(Boolean).join('\n\n');
-  };
+  // Contexto protegido completo (sin resumir el objetivo) construido por context/context-builder.js.
+  const contextText = () => EVO.ContextBuilder ? EVO.ContextBuilder.buildProtectedContext(P())
+    : `Proyecto: ${P().name}\nObjetivo: ${P().protectedData ? P().protectedData.objective.value : P().objective || ''}`;
 
   // ---------- Interfaz ----------
   const h = (tag, props = {}, ...kids) => {
@@ -132,11 +127,49 @@
     .bar.w i{background:var(--wn)}.bar.b i{background:#d1344a}
     .a{padding:6px 8px;margin:4px 0;border-left:3px solid var(--wn);background:rgba(154,91,0,.08);border-radius:0 6px 6px 0}
     .d{white-space:pre-wrap;font:11px/1.3 monospace;margin:8px 0 0;color:var(--mu)}
-    .acts{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}`;
+    .acts{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}` + (EVO.ObjectivePanel ? EVO.ObjectivePanel.STYLES : '');
 
   const refs = {};
   const say = (m) => { refs.status.textContent = m; setTimeout(() => { if (refs.status.textContent === m) refs.status.textContent = ''; }, 4000); };
   const insert = (t) => say(A.insertText(t) ? 'Texto insertado. Revisalo y enviá vos.' : 'No encontré el cuadro de texto: revisá el selector del adaptador.');
+
+  // ---------- Cambios protegidos: revisión → confirmación → guardado con historial ----------
+  function showPending() {
+    if (!pendingChange) { refs.pConfirm.replaceChildren(); return; }
+    const d = EVO.ObjectiveEngine.describeChange(P(), pendingChange);
+    refs.pConfirm.replaceChildren(h('div', { className: 'cf' },
+      h('b', { textContent: 'Revisá el cambio antes de guardarlo' }),
+      h('div', { className: 'm', textContent: d.label }),
+      h('div', { className: 'm', textContent: 'Antes: ' + d.before }),
+      h('div', { className: 'm', textContent: 'Después: ' + d.after }),
+      h('div', { className: 'row' },
+        h('button', { textContent: 'Confirmar guardado', onclick: confirmPending }),
+        h('button', { textContent: 'Cancelar', onclick: () => { pendingChange = null; showPending(); say('Cambio cancelado: no se guardó nada.'); } }))));
+  }
+  function requestChange(change) {
+    const v = EVO.ObjectiveEngine.validateChange(P(), change);
+    if (!v.ok) return say(v.errors.join(' '));
+    pendingChange = change; showPending();
+    say('Cambio en revisión: no se guardó nada todavía.');
+  }
+  function requestCriterion(item) {
+    const ev = prompt('Evidencia concreta de que el criterio se cumplió (ej.: comando ejecutado y resultado):');
+    if (!ev || !ev.trim()) return say('Sin evidencia no se puede marcar cumplido: no se solicitó ningún cambio.');
+    requestChange({ field: 'successCriteria', action: 'setStatus', itemId: item.id, status: 'achieved', evidence: ev.trim() });
+  }
+  async function confirmPending() {
+    if (!pendingChange) return;
+    const change = pendingChange; pendingChange = null; showPending();
+    // Único camino de guardado protegido: actor 'user' + confirmación, validado por el motor.
+    const r = store ? await store.applyProtectedChange(S, S.active, change, { actor: 'user', confirmed: true })
+      : EVO.ObjectiveEngine.applyProtectedChange(P(), change, { actor: 'user', confirmed: true });
+    if (!r.ok) return say('No se guardó: ' + r.error);
+    if (!store) { S.projects[S.active] = r.project; await save(); }
+    if (refs.pObj) delete refs.pObj.dataset.editing;
+    fill(); render();
+    say(`Cambio protegido guardado (versión ${r.entry.version}). Quedó registrado en el historial.`);
+  }
+  const panelActions = { requestChange, requestCriterion };
   const list = (el, items, del) => el.replaceChildren(...items.map((t, i) => h('li', {}, h('span', { textContent: t }), h('button', { textContent: '×', title: 'Quitar', onclick: () => { del(i); save(); render(); } }))));
 
   function markFailed() {
@@ -152,13 +185,14 @@
     refs.diag.textContent = d;
     navigator.clipboard.writeText(d).then(() => say('Diagnóstico copiado al portapapeles.'), () => say('Diagnóstico a la vista (no se pudo copiar).'));
   }
-  function newProj() {
+  async function newProj() {
     const name = prompt('Nombre del proyecto');
     if (!name) return;
-    const id = 'p' + Date.now();
-    S.projects[id] = newProject(name); S.active = id; save(); fill(); render();
+    if (store) await store.createProject(S, name);
+    else { const id = 'p' + Date.now(); S.projects[id] = newProject(name); S.active = id; await save(); }
+    pendingChange = null; fill(); render();
   }
-  const fill = () => { refs.obj.value = P().objective; refs.next.value = P().nextStep; };
+  const fill = () => { refs.next.value = P().nextStep; if (refs.pObj) { delete refs.pObj.dataset.editing; refs.pObj.value = P().protectedData ? P().protectedData.objective.value : ''; } };
 
   function build() {
     const host = h('div'), root = host.attachShadow({ mode: 'open' });
@@ -171,15 +205,14 @@
     Object.assign(refs, {
       status: h('div', { className: 'm' }), live: h('div', { className: 'm' }), meter: h('div', { className: 'm' }), bar: h('div', { className: 'bar' }, h('i')),
       alerts: h('div'), diag: h('pre', { className: 'd' }), dec: h('ul'), rul: h('ul'), fail: h('ul'),
-      proj: h('select', { onchange: () => { S.active = refs.proj.value; save(); fill(); render(); } }),
-      obj: h('textarea', { rows: 2, placeholder: 'Qué se quiere lograr', onchange: () => { P().objective = refs.obj.value; save(); } }),
+      proj: h('select', { onchange: () => { S.active = refs.proj.value; pendingChange = null; save(); fill(); render(); } }),
       next: h('textarea', { rows: 2, placeholder: 'Qué sigue, en una frase', onchange: () => { P().nextStep = refs.next.value; save(); } })
     });
     const panel = h('div', { className: 'p' },
       h('div', { className: 'row' }, h('b', { textContent: 'EVO Memory ' + VERSION }), refs.proj, h('button', { textContent: 'Nuevo', onclick: newProj })),
       refs.bar, refs.meter, refs.live, refs.status,
+      EVO.ObjectivePanel ? EVO.ObjectivePanel.build(h, refs, panelActions) : h('div', { className: 'm', textContent: '⚠ Módulo de datos protegidos no cargado.' }),
       h('h4', { textContent: 'Alertas' }), refs.alerts,
-      h('h4', { textContent: 'Objetivo' }), refs.obj,
       h('h4', { textContent: 'Decisiones confirmadas' }), refs.dec, adder('Decisión (se copia tal cual)', (v) => P().decisions.push(v)),
       h('h4', { textContent: 'No usar' }), refs.rul, adder('Término a evitar', (v) => P().rules.push(v)),
       h('h4', { textContent: 'Intentos fallidos' }), refs.fail,
@@ -203,6 +236,7 @@
     refs.bar.className = 'bar' + (pct >= 90 ? ' b' : pct >= 70 ? ' w' : '');
     refs.bar.firstChild.style.width = pct + '%';
     refs.meter.textContent = `Contexto de esta conversación: ~${ctx.toLocaleString()} tokens (estimación)` + (pct >= 70 ? '. Conviene traspasar a un chat nuevo.' : '');
+    if (refs.pObjView && EVO.ObjectivePanel) EVO.ObjectivePanel.render(h, refs, p, panelActions);
     list(refs.dec, p.decisions, (i) => p.decisions.splice(i, 1));
     list(refs.rul, p.rules, (i) => p.rules.splice(i, 1));
     list(refs.fail, p.failed.map((f) => f.note), (i) => p.failed.splice(i, 1));
@@ -210,8 +244,8 @@
   }
 
   (async () => {
-    const r = await api.storage.local.get(KEY);
-    S = r[KEY] || { active: 'default', projects: { default: newProject('Proyecto 1') } };
+    if (store) { S = await store.loadState(); await save(); } // loadState migra proyectos v0.1 sin perder datos
+    else { const r = await api.storage.local.get(KEY); S = r[KEY] || { active: 'default', projects: { default: newProject('Proyecto 1') } }; }
     build(); fill(); scan();
     new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true, characterData: true });
   })();
