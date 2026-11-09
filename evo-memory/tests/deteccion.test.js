@@ -168,4 +168,50 @@ assert.ok(d.reconciliados >= 1);
 assert.strictEqual(d.total, 2);
 ok('Elemento DOM reemplazado: reconciliación por autor + posición relativa + huella exacta');
 
-console.log(`\nTodas las pruebas de detección pasaron (${n}/9).`);
+// 10. Estructura reciente data-turn-key: dos mensajes del asistente en el mismo turno NO se fusionan
+const doc6 = makeDoc([]);
+doc6._main.appendChild(el('div', { 'data-turn-key': 'tk-1' }, '', [
+  el('button', { 'data-user-message-bubble': '' }, 'Pregunta dentro de botón burbuja'),
+  el('div', { 'data-message-author-role': 'assistant' }, 'Primera respuesta del turno'),
+  el('div', { 'data-message-author-role': 'assistant' }, 'Segunda respuesta distinta del mismo turno')
+]));
+global.document = doc6;
+d = A.detect();
+assert.strictEqual(d.total, 3, 'turno compartido no fusiona mensajes');
+assert.deepStrictEqual([d.user, d.assistant], [1, 2]);
+assert.strictEqual(d.messages[0].text, 'Pregunta dentro de botón burbuja', 'el texto del usuario en button no se descarta');
+assert.strictEqual(new Set(d.messages.map((m) => m.id)).size, 3, 'ids únicos dentro del mismo turno');
+ok('data-turn-key: burbuja de usuario leída y asistentes del mismo turno sin fusionar');
+
+// 11. Variantes recientes directas: data-conversation-role y data-markdown-text-style
+const doc7 = makeDoc([]);
+doc7._main.appendChild(el('div', { 'data-conversation-role': 'user' }, 'Mensaje por conversation-role'));
+doc7._main.appendChild(el('div', { 'data-markdown-text-style': 'assistant-message' }, 'Respuesta por markdown assistant'));
+global.document = doc7;
+d = A.detect();
+assert.deepStrictEqual([d.total, d.user, d.assistant], [2, 1, 1]);
+ok('data-conversation-role y data-markdown-text-style="assistant-message" clasificados por atributo');
+
+// 12. Estructura de transcripción: ol[data-conversation-transcript] > li[data-message-role]
+const doc8 = makeDoc([]);
+doc8._main.appendChild(el('ol', { 'data-conversation-transcript': '' }, '', [
+  el('li', { 'data-message-role': 'user' }, 'Transcripción: pregunta'),
+  el('li', { 'data-message-role': 'assistant' }, 'Transcripción: respuesta')
+]));
+global.document = doc8;
+d = A.detect();
+assert.deepStrictEqual([d.total, d.user, d.assistant], [2, 1, 1]);
+assert.strictEqual(d.messages[1].text, 'Transcripción: respuesta');
+ok('Transcripción ol > li[data-message-role] detectada sin duplicar con otros selectores');
+
+// 13. Estructura no clasificable: se informa no reconocida, no se inventa autor ni contenido
+const doc9 = makeDoc([]);
+doc9._main.appendChild(el('div', { 'data-turn-key': 'tk-x' }, 'Texto sin rol reconocible'));
+global.document = doc9;
+d = A.detect();
+assert.strictEqual(d.total, 0);
+assert.strictEqual(d.status, 'fallido');
+assert.ok(d.unclassified >= 1, 'el descarte queda contado como no clasificado');
+ok('Sin rol semántico: no se inventa autor y el diagnóstico lo informa');
+
+console.log(`\nTodas las pruebas de detección pasaron (${n}/13).`);

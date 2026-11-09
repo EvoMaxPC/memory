@@ -27,7 +27,7 @@
   // Motor en tiempo real: activo hasta que el usuario lo detiene (conserva el autoescaneo histórico).
   let detectionActive = true, msgObserver = null, structObserver = null, obsContainer = null, obsConv = '';
   let convState = 'esperando', lastUpdate = null, lastChangeAt = 0, procTimer = null, structTimer = null;
-  let dupEvitados = 0, erroresLectura = 0, mutPendientes = 0;
+  let dupEvitados = 0, erroresLectura = 0, mutPendientes = 0, wasStreaming = false;
   const P = () => S.projects[S.active];
   const save = () => store ? store.saveState(S) : api.storage.local.set({ [KEY]: S });
   const addAlert = (kind, msg) => { const p = P(); p.alerts.unshift({ t: Date.now(), kind, msg }); p.alerts.length = Math.min(p.alerts.length, 40); };
@@ -67,18 +67,27 @@
     }
   }
 
-  // Procesa mensajes ya detectados SIN duplicar: `seen` guarda la firma (largo) de cada id estable.
+  // Firma del contenido COMPLETO (texto + código): detecta cambios aunque la longitud no varíe.
+  const contentHash = (s) => { let hsh = 0x811c9dc5; const t = String(s || ''); for (let i = 0; i < t.length; i++) { hsh ^= t.charCodeAt(i); hsh = Math.imul(hsh, 0x01000193); } return (hsh >>> 0).toString(36); };
+  // Procesa mensajes ya detectados SIN duplicar: `seen` guarda la firma completa de cada id estable.
   // Un mensaje cuyo texto creció se actualiza como el mismo mensaje, no como uno nuevo.
-  function ingest(msgs, silent) {
+  // Análisis: el usuario se analiza al registrarse; el asistente SOLO cuando no hay streaming
+  // (nunca se analiza una respuesta incompleta como definitiva) y solo una vez por versión final:
+  // `analyzed` guarda la firma ya analizada, así la versión final conserva sus bloques de código
+  // sin generar alertas ni registros duplicados por cada fragmento intermedio.
+  function ingest(msgs, silent, streaming) {
     const p = P();
+    if (!p.analyzed || typeof p.analyzed !== 'object') p.analyzed = {};
     ctx = 0; let dirty = false; lastIngest = { nuevos: 0, actualizados: 0, manual: lastIngest.manual };
     for (const m of msgs) {
       ctx += EVO.estimateTokens(m.text);
-      const firma = m.text.length + ':' + m.code.reduce((a, b) => a + b.code.length, 0);
-      if (!p.seen[m.id]) { p.seen[m.id] = firma; dirty = true; lastIngest.nuevos++; analyze(m, silent); }
+      const firma = m.text.length + ':' + contentHash(m.text) + ':' + m.code.map((b) => contentHash(b.code)).join(',');
+      if (!p.seen[m.id]) { p.seen[m.id] = firma; dirty = true; lastIngest.nuevos++; }
       else if (p.seen[m.id] !== firma && p.seen[m.id] !== 1) { p.seen[m.id] = firma; dirty = true; lastIngest.actualizados++; }
       else if (p.seen[m.id] === 1) { p.seen[m.id] = firma; dirty = true; } // formato viejo (solo presencia)
       else dupEvitados++; // mismo id y mismo contenido: duplicado evitado, no se reprocesa
+      if (m.role === 'user') { if (!p.analyzed[m.id]) { p.analyzed[m.id] = firma; dirty = true; analyze(m, silent); } }
+      else if (!streaming && p.analyzed[m.id] !== firma) { p.analyzed[m.id] = firma; dirty = true; analyze(m, silent); }
     }
     return dirty;
   }
@@ -89,7 +98,8 @@
     const silent = !p.convs[cid]; // al abrir un chat antiguo se aprende del historial sin lanzar alertas
     detectInfo = d; nMsgs = d.total;
     lastIngest.manual = !!manual;
-    let dirty = ingest(d.messages, silent);
+    wasStreaming = !!(d.streaming || A.isStreaming());
+    let dirty = ingest(d.messages, silent, wasStreaming);
     if (d.messages.length && !p.convs[cid]) { p.convs[cid] = 1; dirty = true; }
     if (dirty) save();
     lastSig = d.messages.length + ':' + (d.messages.length ? d.messages[d.messages.length - 1].text.length : 0);
@@ -113,7 +123,7 @@
   const schedule = () => { if (!detectionActive) return; clearTimeout(procTimer); procTimer = setTimeout(scan, 350); };
   // Si dejó de llegar texto y no hay señal de generación, la respuesta queda "actualizada":
   // es solo un indicio (ausencia de cambios + sin botón de detener), nunca una prueba absoluta.
-  const scheduleSettle = () => { clearTimeout(timer); timer = setTimeout(() => { if (detectionActive && !A.isStreaming() && detectInfo && detectInfo.total) { convState = 'actualizada'; render(); } }, 1600); };
+  const scheduleSettle = () => { clearTimeout(timer); timer = setTimeout(() => { if (detectionActive && !A.isStreaming() && detectInfo && detectInfo.total) scan(); }, 1600); }; // ese escaneo analiza por fin la versión completa (antes diferida)
 
   // --- Observador de mensajes: solo el contenedor de la conversación (no toda la página) ---
   function attachMessageObserver() {
@@ -151,6 +161,7 @@
           say(`Conversación cambiada (${cid}): se separan los mensajes de esta conversación; los registros anteriores se conservan.`);
           scan();
         } else if (!contOk) { obsContainer = null; scan(); } // contenedor reconstruido o mensajes recién cargados
+        else if (A.isStreaming() !== wasStreaming) schedule(); // apareció/desapareció la señal de generación (p. ej. botón detener fuera del contenedor): reevaluar y, si terminó, analizar la versión final
       }, 500);
     });
     structObserver.observe(document.body, { childList: true, subtree: true });
@@ -173,7 +184,7 @@
     }
   }
   function stopDetection() {
-    detectionActive = false;
+    detectionActive = false; obsContainer = null;
     if (msgObserver) { msgObserver.disconnect(); msgObserver = null; }
     if (structObserver) { structObserver.disconnect(); structObserver = null; }
     clearTimeout(procTimer); clearTimeout(timer); clearTimeout(structTimer);

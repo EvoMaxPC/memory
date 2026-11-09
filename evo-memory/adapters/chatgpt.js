@@ -17,12 +17,23 @@
   const hash = (s) => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); };
   const attr = (el, n) => (el && el.getAttribute ? el.getAttribute(n) : null);
 
+  // Variantes conocidas de la interfaz: anteriores, recientes y transcripción. El rol NUNCA se
+  // deduce por posición ni alternancia: sale de atributos semánticos o no se clasifica.
   const STRATEGIES = [
-    { name: 'author-role', sel: '[data-message-author-role]' },
-    { name: 'article-data-turn', sel: 'article[data-turn]' },
-    { name: 'conversation-turn', sel: '[data-testid^="conversation-turn-"]' },
-    { name: 'data-turn', sel: '[data-turn]' }
+    { name: 'author-role', sel: '[data-message-author-role]', kind: 'direct' },
+    { name: 'article-data-turn', sel: 'article[data-turn]', kind: 'turn' },
+    { name: 'conversation-turn', sel: '[data-testid^="conversation-turn-"]', kind: 'turn' },
+    { name: 'data-turn', sel: '[data-turn]', kind: 'turn' },
+    { name: 'turn-key', sel: '[data-turn-key]', kind: 'turn' },
+    { name: 'search-unit', sel: '[data-content-search-unit-key]', kind: 'turn' },
+    { name: 'user-bubble', sel: '[data-user-message-bubble]', kind: 'direct' },
+    { name: 'conversation-role', sel: '[data-conversation-role]', kind: 'direct' },
+    { name: 'agent-turn', sel: '[data-chatgpt-agent-turn-start]', kind: 'turn' },
+    { name: 'assistant-markdown', sel: '[data-markdown-text-style="assistant-message"]', kind: 'direct' },
+    { name: 'transcript', sel: 'li[data-message-role]', kind: 'transcript' }
   ];
+  const INNER_MESSAGE_SEL = '[data-message-author-role], [data-conversation-role], [data-message-role], [data-user-message-bubble], [data-markdown-text-style="assistant-message"]';
+  const ID_ATTRS = ['data-message-id', 'data-turn-key', 'data-content-search-unit-key', 'data-turn-id'];
   const COMPOSERS = [
     ['prompt-textarea', '#prompt-textarea'],
     ['prosemirror', 'div.ProseMirror[contenteditable="true"]'],
@@ -42,11 +53,16 @@
   const turnOf = (el) => {
     for (let n = el.parentElement; n; n = n.parentElement) {
       const tid = attr(n, 'data-testid');
-      if (attr(n, 'data-turn-id') || (tid && tid.startsWith('conversation-turn-')) || (n.tagName === 'ARTICLE' && attr(n, 'data-turn'))) return n;
+      if (attr(n, 'data-turn-id') || attr(n, 'data-turn-key') || attr(n, 'data-content-search-unit-key') || (tid && tid.startsWith('conversation-turn-')) || (n.tagName === 'ARTICLE' && attr(n, 'data-turn'))) return n;
     }
     return null;
   };
   const validRole = (r) => (r === 'user' || r === 'assistant' ? r : null);
+  // Rol explícito por semántica del atributo/elemento. Sin atributo reconocible -> null (no se inventa).
+  const roleOf = (el) => validRole(attr(el, 'data-message-author-role') || attr(el, 'data-conversation-role') || attr(el, 'data-message-role') || attr(el, 'data-turn'))
+    || (attr(el, 'data-user-message-bubble') !== null ? 'user' : null)
+    || (attr(el, 'data-markdown-text-style') === 'assistant-message' ? 'assistant' : null)
+    || (attr(el, 'data-chatgpt-agent-turn-start') !== null ? 'assistant' : null);
 
   // Texto visible: en el mensaje individual se usa innerText (conserva saltos, títulos y listas).
   // En un contenedor de turno (respaldo) se clona y se quitan botones/controles antes de leer.
@@ -54,7 +70,10 @@
     if (!isTurn) return (el.innerText || el.textContent || '').replace(/\s+$/, '').replace(/^\s+/, '');
     try {
       const clone = el.cloneNode(true);
-      clone.querySelectorAll('button, [role="button"], nav, textarea, select, input, svg').forEach((n) => n.remove());
+      // Se quitan controles, pero NUNCA un button[data-user-message-bubble]: ahí vive el texto del usuario.
+      const inUserBubble = (n) => { for (let x = n; x && x !== clone.parentElement; x = x.parentElement) if (attr(x, 'data-user-message-bubble') !== null) return true; return false; };
+      [...clone.querySelectorAll('button, [role="button"], nav, textarea, select, input, svg')]
+        .filter((n) => !inUserBubble(n)).forEach((n) => n.remove());
       return (clone.innerText || clone.textContent || '').trim();
     } catch (e) { return (el.innerText || el.textContent || '').trim(); }
   }
@@ -67,12 +86,19 @@
     }).filter((b) => b.code.trim().length);
   }
   function stableId(contentEl, turnEl, role, text, pos, ctx) {
-    const mid = attr(contentEl, 'data-message-id') || attr(turnEl, 'data-message-id');
-    if (mid) return 'msg:' + mid;
-    const tid = attr(contentEl, 'data-turn-id') || attr(turnEl, 'data-turn-id') || attr(turnEl, 'data-testid');
-    if (tid) return 'turn:' + tid + ':' + role;
+    // 1) Identificador propio del mensaje (elemento de contenido): es individual, no se comparte.
+    for (const a of ID_ATTRS) { const v = attr(contentEl, a); if (v) return (a === 'data-message-id' ? 'msg:' : 'key:' + a + ':') + v; }
+    // 2) Identificador del turno/contenedor: si el turno agrupa varios mensajes del mismo rol, se
+    //    agrega posición relativa en el turno + huella del inicio para NO fusionarlos entre sí.
+    for (const a of [...ID_ATTRS, 'data-testid']) {
+      const v = attr(turnEl, a);
+      if (v && turnEl !== contentEl) {
+        const base = (a === 'data-message-id' ? 'msg:' : 'turn:') + v + ':' + role;
+        return ctx.turnRoleTotal > 1 ? `${base}:${ctx.turnRolePos}:${hash(text.slice(0, 160))}` : base;
+      }
+    }
     const nid = contentEl.id || (turnEl && turnEl.id);
-    if (nid) return 'node:' + nid + ':' + role;
+    if (nid) return 'node:' + nid + ':' + role + (ctx.turnRoleTotal > 1 ? ':' + ctx.turnRolePos + ':' + hash(text.slice(0, 160)) : '');
     if (elIdentity.has(contentEl)) return elIdentity.get(contentEl); // mismo elemento DOM ya identificado
     // Elemento reemplazado: reconciliar solo con evidencia exacta (autor + posición relativa + huella del inicio)
     const ph = hash(text.slice(0, 160));
@@ -80,60 +106,96 @@
     if (prev) { ctx.reconciliados++; return prev.id; }
     return 'fp:' + role + ':' + pos + ':' + ph; // inicio del texto: estable si crece al final
   }
-  // Ancestro común más profundo de los mensajes (sin salir del ámbito): el contenedor observable.
+  // Ancestro común más profundo que contiene TODOS los mensajes (puede ser el propio ámbito/main).
+  // Si ningún ancestro los contiene a todos, devuelve null: jamás se usa el primer mensaje como
+  // contenedor alternativo en silencio; el diagnóstico lo informa y no se observa un nodo parcial.
   function commonContainer(els, scope) {
     if (!els.length) return null;
     let node = els[0];
-    while (node.parentElement && node.parentElement !== scope && els.every((e) => node.parentElement.contains(e))) node = node.parentElement;
-    return els.every((e) => node.contains(e)) ? node : els[0];
+    while (node !== scope && node.parentElement && els.every((e) => node.parentElement.contains(e))) node = node.parentElement;
+    if (els.every((e) => node.contains(e))) return node;
+    return scope && els.every((e) => scope.contains(e)) ? scope : null;
   }
   const describeEl = (el) => el ? `${el.tagName.toLowerCase()}${el.id ? '#' + el.id : ''}${attr(el, 'data-testid') ? `[data-testid="${attr(el, 'data-testid')}"]` : ''}` : 'no encontrado';
 
   // Candidatos de una estrategia: [{contentEl, turnEl, role}] sin inventar roles.
-  function candidates(strategy, scope) {
-    const els = outer($$(strategy.sel, scope)).filter((e) => !inEvo(e));
+  function candidatesFor(strategy, scope) {
     const out = [];
-    if (strategy.name === 'author-role') {
-      for (const el of els) out.push({ contentEl: el, turnEl: turnOf(el) || el, role: validRole(attr(el, 'data-message-author-role')), isTurn: false });
+    if (strategy.kind === 'transcript') { // ol[data-conversation-transcript] > li[data-message-role] (hijos directos)
+      for (const list of outer($$('ol[data-conversation-transcript]', scope)).filter((e) => !inEvo(e)))
+        for (const li of [...list.children].filter((c) => c.tagName === 'LI' && attr(c, 'data-message-role') !== null && !inEvo(c)))
+          out.push({ contentEl: li, turnEl: li, role: roleOf(li), isTurn: false, strategy: strategy.name });
       return out;
     }
+    const els = outer($$(strategy.sel, scope)).filter((e) => !inEvo(e));
+    if (strategy.kind === 'direct') {
+      for (const el of els) out.push({ contentEl: el, turnEl: turnOf(el) || el, role: roleOf(el), isTurn: false, strategy: strategy.name });
+      return out;
+    }
+    // Contenedores de turno/unidad: si adentro hay mensajes individuales, se leen ESOS (el turno no
+    // se cuenta como mensaje); si no hay, el contenedor solo se usa si su rol es semántico y claro.
     for (const turn of els) {
-      const inside = outer($$('[data-message-author-role]', turn)).filter((e) => !inEvo(e));
-      if (inside.length) for (const el of inside) out.push({ contentEl: el, turnEl: turn, role: validRole(attr(el, 'data-message-author-role')), isTurn: false });
-      else out.push({ contentEl: turn, turnEl: turn, role: validRole(attr(turn, 'data-turn')), isTurn: true });
+      const inside = outer($$(INNER_MESSAGE_SEL, turn)).filter((e) => !inEvo(e));
+      if (inside.length) for (const el of inside) out.push({ contentEl: el, turnEl: turn, role: roleOf(el), isTurn: false, strategy: strategy.name });
+      else out.push({ contentEl: turn, turnEl: turn, role: roleOf(turn), isTurn: true, strategy: strategy.name });
     }
     return out;
+  }
+  // Unión de TODAS las estrategias, deduplicada por elemento: varios selectores pueden apuntar al
+  // mismo mensaje (p. ej. turno y su mensaje interno) y debe contarse una sola vez. El orden final
+  // es el orden del documento, no el de los selectores.
+  function allCandidates(scope) {
+    const byEl = new Map();
+    for (const s of STRATEGIES) for (const cand of candidatesFor(s, scope)) if (!byEl.has(cand.contentEl)) byEl.set(cand.contentEl, cand);
+    let ordered = [...byEl.values()];
+    // Contenedor y contenido no son dos mensajes: si un candidato contiene a otro (p. ej. li de
+    // transcripción y su mensaje interno), se conserva el de la estrategia prioritaria.
+    const prio = new Map(STRATEGIES.map((s, i) => [s.name, i]));
+    ordered = ordered.filter((c) => !ordered.some((o) => o !== c && prio.get(o.strategy) < prio.get(c.strategy)
+      && (c.contentEl.contains(o.contentEl) || o.contentEl.contains(c.contentEl))));
+    try {
+      const order = new Map([scope, ...$$('*', scope)].map((e, i) => [e, i]));
+      ordered.sort((a, b) => (order.get(a.contentEl) ?? 1e9) - (order.get(b.contentEl) ?? 1e9));
+    } catch (e) { /* sin orden disponible: se conserva el orden de descubrimiento */ }
+    return ordered;
   }
 
   function detect() {
     const scope = scopeRoot(), selectorCounts = {};
     for (const s of STRATEGIES) { try { selectorCounts[s.name] = $$(s.sel, scope).length; } catch (e) { selectorCounts[s.name] = 0; } }
-    let strategy = 'ninguna', messages = [], chosenEls = [], duplicates = 0, unclassified = 0, skippedEmpty = 0, reconciliados = 0;
-    for (const s of STRATEGIES) {
-      const byId = new Map(), elsById = new Map(), roleCount = { user: 0, assistant: 0 }, fpNow = [];
-      for (const cand of candidates(s, scope)) {
-        if (!cand.role) { unclassified++; continue; }
-        const text = visibleText(cand.contentEl, cand.isTurn), code = extractCode(cand.contentEl);
-        if (!text && !code.length) { skippedEmpty++; continue; } // carga / razonamiento no visible / vacío
-        const ctx = { rolePos: roleCount[cand.role]++, reconciliados: 0 };
-        const id = stableId(cand.contentEl, cand.turnEl, cand.role, text, byId.size, ctx);
-        reconciliados += ctx.reconciliados;
-        const timeEl = cand.contentEl.querySelector ? cand.contentEl.querySelector('time') : null;
-        const msg = { id, role: cand.role, text, code, timestamp: attr(timeEl, 'datetime') || null };
-        if (id.startsWith('fp:')) fpNow.push({ id, role: cand.role, ph: hash(text.slice(0, 160)), rolePos: ctx.rolePos });
-        if (byId.has(id)) { // mismo mensaje repetido o actualizado: conserva el contenido más completo
-          duplicates++;
-          const prev = byId.get(id);
-          if (msg.text.length >= prev.text.length) { byId.set(id, msg); elsById.set(id, cand.contentEl); }
-        } else { byId.set(id, msg); elsById.set(id, cand.contentEl); }
-      }
-      if (byId.size) {
-        strategy = s.name; messages = [...byId.values()]; chosenEls = [...elsById.values()];
-        for (const [id, el] of elsById) elIdentity.set(el, id);
-        prevFingerprintRegistry = fpNow;
-        break;
-      }
+    let messages = [], chosenEls = [], duplicates = 0, unclassified = 0, skippedEmpty = 0, reconciliados = 0;
+    const cands = allCandidates(scope);
+    const turnRoleTotal = new Map(), turnRoleSeen = new Map();
+    for (const c of cands) { // cuántos mensajes del mismo rol comparten cada turno (para no fusionarlos)
+      if (!c.role) continue;
+      const k = c.turnEl;
+      if (!turnRoleTotal.has(k)) turnRoleTotal.set(k, { user: 0, assistant: 0 });
+      turnRoleTotal.get(k)[c.role]++;
     }
+    const byId = new Map(), elsById = new Map(), roleCount = { user: 0, assistant: 0 }, fpNow = [], usedStrategies = new Set();
+    for (const cand of cands) {
+      if (!cand.role) { unclassified++; continue; }
+      const text = visibleText(cand.contentEl, cand.isTurn), code = extractCode(cand.contentEl);
+      if (!text && !code.length) { skippedEmpty++; continue; } // carga / razonamiento no visible / vacío
+      const tKey = cand.turnEl;
+      if (!turnRoleSeen.has(tKey)) turnRoleSeen.set(tKey, { user: 0, assistant: 0 });
+      const ctx = { rolePos: roleCount[cand.role]++, turnRolePos: turnRoleSeen.get(tKey)[cand.role]++, turnRoleTotal: turnRoleTotal.get(tKey)[cand.role], reconciliados: 0 };
+      const id = stableId(cand.contentEl, cand.turnEl, cand.role, text, byId.size, ctx);
+      reconciliados += ctx.reconciliados;
+      usedStrategies.add(cand.strategy);
+      const timeEl = cand.contentEl.querySelector ? cand.contentEl.querySelector('time') : null;
+      const msg = { id, role: cand.role, text, code, timestamp: attr(timeEl, 'datetime') || null };
+      if (id.startsWith('fp:')) fpNow.push({ id, role: cand.role, ph: hash(text.slice(0, 160)), rolePos: ctx.rolePos });
+      if (byId.has(id)) { // mismo mensaje repetido o actualizado: conserva el contenido más completo
+        duplicates++;
+        const prev = byId.get(id);
+        if (msg.text.length >= prev.text.length) { byId.set(id, msg); elsById.set(id, cand.contentEl); }
+      } else { byId.set(id, msg); elsById.set(id, cand.contentEl); }
+    }
+    messages = [...byId.values()]; chosenEls = [...elsById.values()];
+    for (const [id, el] of elsById) elIdentity.set(el, id);
+    if (messages.length) prevFingerprintRegistry = fpNow;
+    const strategy = messages.length ? [...usedStrategies].join('+') : 'ninguna';
     lastContainer = commonContainer(chosenEls, scope);
     const chars = messages.reduce((a, m) => a + m.text.length, 0);
     const tokens = EVO.estimateTokens ? messages.reduce((a, m) => a + EVO.estimateTokens(m.text), 0) : Math.ceil(chars / 4);
@@ -141,7 +203,7 @@
     let status;
     if (!messages.length) {
       status = 'fallido';
-      reasons.push('No se encontró ningún mensaje con los selectores conocidos ([data-message-author-role], article[data-turn], [data-testid^="conversation-turn-"], [data-turn]).');
+      reasons.push('No se encontró ningún mensaje con las estructuras conocidas ([data-message-author-role], article[data-turn], [data-testid^="conversation-turn-"], [data-turn-key], [data-content-search-unit-key], [data-user-message-bubble], [data-conversation-role], [data-chatgpt-agent-turn-start], [data-markdown-text-style="assistant-message"], transcripción li[data-message-role]). El DOM de esta página no es compatible con las variantes conocidas o todavía no cargó la conversación.');
       reasons.push(document.querySelector('main') ? 'La página tiene <main> pero sin mensajes reconocibles: puede ser un chat vacío, la sesión no cargó la conversación o ChatGPT cambió su estructura. Abrí una conversación con mensajes y reintentá; si persiste, copiá el «Diagnóstico».'
         : 'Ni siquiera se encontró el contenedor <main>: la conversación no terminó de cargar o no estás en una página de chat.');
     } else {
@@ -150,8 +212,9 @@
       if (messages[0].role === 'assistant') reasons.push('El primer mensaje cargado en el DOM es del asistente: es probable que falten mensajes anteriores todavía no cargados (historial virtualizado).');
       if (unclassified) reasons.push(`${unclassified} elemento(s) sin rol reconocible fueron omitidos (no se les inventó un rol).`);
       if (skippedEmpty) reasons.push(`${skippedEmpty} elemento(s) vacíos o de carga fueron omitidos.`);
+      if (!lastContainer) reasons.push('Se encontraron mensajes pero ningún ancestro común los contiene a todos: no se pudo fijar un contenedor de conversación observable (la estructura puede haber cambiado).');
       status = reasons.length && (streaming || messages[0].role === 'assistant') ? 'parcial' : 'dom-completo';
-      if (status === 'dom-completo' && (unclassified || skippedEmpty)) status = 'parcial';
+      if (status === 'dom-completo' && (unclassified || skippedEmpty || !lastContainer)) status = 'parcial';
     }
     lastDetect = {
       ok: messages.length > 0, status, strategy, messages,
