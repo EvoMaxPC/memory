@@ -1,6 +1,7 @@
 // Panel de datos protegidos (Capa 1): construye y actualiza la sección «🔒 Protegido» del panel.
-// Todo cambio pasa por actions.requestChange(change): NADA se guarda desde aquí directamente;
-// content.js muestra el antes/después y recién guarda si el usuario confirma.
+// NADA se guarda desde aquí directamente: el objetivo va por actions.requestObjective (guarda el
+// primero; si ya existe, content.js muestra Antes/Después y solo guarda si el usuario confirma)
+// y el resto por actions.requestChange(change), con la misma confirmación.
 (function (root) {
   const EVO = (root.EVO = root.EVO || {});
   const STYLES = `
@@ -29,8 +30,8 @@
       h('div', { className: 'row' }, h('b', { textContent: 'Datos protegidos' }), h('span', { className: 'lock', textContent: '🔒 SOLO EL USUARIO PUEDE CAMBIARLOS' })),
       h('div', { className: 'm', textContent: 'La IA recibe estos datos completos pero no puede modificarlos. Todo cambio pide revisión y confirmación, y queda en el historial.' }),
       refs.pTamper,
-      h('h4', { textContent: 'Objetivo principal (completo)' }), refs.pObjView, refs.pObj,
-      h('button', { textContent: 'Solicitar cambio de objetivo', onclick: () => actions.requestChange({ field: 'objective', action: 'set', value: refs.pObj.value }) }),
+      h('h4', { textContent: 'OBJETIVO PROTEGIDO' }), refs.pObjView, refs.pObj,
+      h('button', { textContent: 'Guardar y proteger objetivo', onclick: () => (actions.requestObjective ? actions.requestObjective(refs.pObj.value) : actions.requestChange({ field: 'objective', action: 'set', value: refs.pObj.value })) }),
       h('h4', { textContent: 'Prohibiciones' }), refs.pProh, adder('Prohibición (ej.: No usar jQuery)', 'prohibitions'),
       h('h4', { textContent: 'Instrucciones obligatorias' }), refs.pInst, adder('Instrucción (ej.: Ejecutar los tests siempre)', 'instructions'),
       h('h4', { textContent: 'Criterios de éxito' }), refs.pCrit, adder('Criterio (ej.: Los tests pasan)', 'successCriteria'),
@@ -54,7 +55,7 @@
     fillList(refs.pProh, prot.prohibitions, 'prohibitions');
     fillList(refs.pInst, prot.instructions, 'instructions');
     fillList(refs.pCrit, prot.successCriteria, 'successCriteria', (c) => c.status === 'achieved' ? ` ✓ cumplido (evidencia: ${c.evidence})` : ' · pendiente');
-    refs.pHist.replaceChildren(...((project.history || []).length ? project.history.slice(0, 20).map((e) =>
+    refs.pHist.replaceChildren(...((project.history || []).length ? project.history.map((e) =>
       h('li', {}, h('span', { textContent: `${new Date(e.at).toLocaleString()} · v${e.version} · ${EVO.ObjectiveEngine.LABELS[e.field] || e.field}: «${String(e.before || '(vacío)').slice(0, 60)}» → «${String(e.after || '').slice(0, 60)}»` })))
       : [h('li', {}, h('span', { className: 'pend', textContent: 'Sin cambios registrados.' }))]));
   }

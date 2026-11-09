@@ -14,7 +14,7 @@
       'REGLAS DE PROTECCIÓN: no podés modificar, reducir, reemplazar ni dar por cumplido ninguno de estos datos. ' +
         'Solo el usuario puede cambiarlos, desde la extensión y con confirmación. Si una propuesta tuya contradice el objetivo o las prohibiciones, señalá el conflicto y conservá los datos originales.',
       `Proyecto: ${p.name || '(sin nombre)'}`,
-      `OBJETIVO PRINCIPAL (completo, textual — no es un resumen):\n${prot.objective.value ? prot.objective.value : FALTA}`,
+      `OBJETIVO PROTEGIDO (completo, textual — no es un resumen):\n${prot.objective.value ? prot.objective.value : FALTA}`,
       `PROHIBICIONES (respetar siempre):\n${list(prot.prohibitions, (x) => x.text)}`,
       `INSTRUCCIONES OBLIGATORIAS (respetar siempre):\n${list(prot.instructions, (x) => x.text)}`,
       `CRITERIOS DE ÉXITO:\n${list(prot.successCriteria, crit)}`,

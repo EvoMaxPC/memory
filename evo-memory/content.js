@@ -3,7 +3,7 @@
   'use strict';
   const api = globalThis.browser ?? globalThis.chrome; // Firefox expone "browser"; Chromium, "chrome"
   const EVO = globalThis.EVO, A = EVO.adapter;
-  const VERSION = 'v0.1.1', KEY = 'evo_state_v1';
+  const VERSION = 'v0.2.0', KEY = 'evo_state_v1'; // debe coincidir con "version" de manifest.json
   const LIMIT = 60000; // tokens aproximados a partir de los cuales se sugiere traspasar a un chat nuevo
 
   const CONTRACT = [
@@ -138,7 +138,7 @@
     if (!pendingChange) { refs.pConfirm.replaceChildren(); return; }
     const d = EVO.ObjectiveEngine.describeChange(P(), pendingChange);
     refs.pConfirm.replaceChildren(h('div', { className: 'cf' },
-      h('b', { textContent: 'Revisá el cambio antes de guardarlo' }),
+      h('b', { textContent: pendingChange.field === 'objective' ? 'Ya existe un OBJETIVO PROTEGIDO. Confirmá solo si querés reemplazarlo:' : 'Revisá el cambio antes de guardarlo' }),
       h('div', { className: 'm', textContent: d.label }),
       h('div', { className: 'm', textContent: 'Antes: ' + d.before }),
       h('div', { className: 'm', textContent: 'Después: ' + d.after }),
@@ -151,6 +151,17 @@
     if (!v.ok) return say(v.errors.join(' '));
     pendingChange = change; showPending();
     say('Cambio en revisión: no se guardó nada todavía.');
+  }
+  // Botón «Guardar y proteger objetivo»: sin objetivo previo guarda directo (clic explícito del
+  // usuario); si ya existe uno, exige confirmación con Antes/Después y cancelar lo conserva.
+  function requestObjective(value) {
+    const change = { field: 'objective', action: 'set', value: value || '' };
+    const v = EVO.ObjectiveEngine.validateChange(P(), change);
+    if (!v.ok) return say(v.errors.join(' '));
+    const current = P().protectedData && P().protectedData.objective ? P().protectedData.objective.value : '';
+    if (!current) { pendingChange = change; confirmPending(); return; } // primer guardado
+    if (current === change.value) return say('Ese texto ya es el OBJETIVO PROTEGIDO guardado: no hubo cambios.');
+    requestChange(change); // modificación: queda en revisión hasta confirmar; cancelar conserva el anterior
   }
   function requestCriterion(item) {
     const ev = prompt('Evidencia concreta de que el criterio se cumplió (ej.: comando ejecutado y resultado):');
@@ -167,9 +178,9 @@
     if (!store) { S.projects[S.active] = r.project; await save(); }
     if (refs.pObj) delete refs.pObj.dataset.editing;
     fill(); render();
-    say(`Cambio protegido guardado (versión ${r.entry.version}). Quedó registrado en el historial.`);
+    say(change.field === 'objective' ? `OBJETIVO PROTEGIDO guardado (versión ${r.entry.version}). Quedó registrado en el historial.` : `Cambio protegido guardado (versión ${r.entry.version}). Quedó registrado en el historial.`);
   }
-  const panelActions = { requestChange, requestCriterion };
+  const panelActions = { requestChange, requestCriterion, requestObjective };
   const list = (el, items, del) => el.replaceChildren(...items.map((t, i) => h('li', {}, h('span', { textContent: t }), h('button', { textContent: '×', title: 'Quitar', onclick: () => { del(i); save(); render(); } }))));
 
   function markFailed() {

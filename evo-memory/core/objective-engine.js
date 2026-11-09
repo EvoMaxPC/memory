@@ -82,7 +82,7 @@
       : change.action === 'add' ? change.value.trim() : change.action === 'setStatus' ? `${before} → ${change.status}` : '(eliminado)';
     prot.version += 1; prot.integrity = integrityOf(prot);
     const entry = { id: 'h' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), at: now, actor: 'user', field: change.field, action: change.action, before, after, version: prot.version };
-    next.history = [entry, ...(next.history || [])].slice(0, 200);
+    next.history = [entry, ...(next.history || [])]; // historial completo: no se recorta ni se limita
     return { ok: true, project: next, entry };
   }
 
